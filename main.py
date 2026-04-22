@@ -83,14 +83,15 @@ def transcribe():
         abc = midi_to_abc(midi_path, title)
 
         # Extract note events for piano animation
+        # Cast all values to native Python types (numpy int64/float32 are not JSON serializable)
         notes = []
         for instrument in midi_data.instruments:
             for note in instrument.notes:
                 notes.append({
-                    'pitch':     note.pitch,
-                    'startTime': round(note.start, 3),
-                    'endTime':   round(note.end, 3),
-                    'velocity':  note.velocity,
+                    'pitch':     int(note.pitch),
+                    'startTime': round(float(note.start), 3),
+                    'endTime':   round(float(note.end), 3),
+                    'velocity':  int(note.velocity),
                 })
         notes.sort(key=lambda n: n['startTime'])
 
