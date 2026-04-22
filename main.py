@@ -28,12 +28,19 @@ def midi_to_abc(midi_path: str, title: str = "Untitled") -> str:
     with tempfile.NamedTemporaryFile(suffix='.abc', delete=False) as tmp:
         tmp_path = tmp.name
 
-    score.write('abc', fp=tmp_path)
+    # music21.write() returns the actual path (may append .abc to our path)
+    result = score.write('abc', fp=tmp_path)
+    actual_path = str(result) if result and os.path.exists(str(result)) else tmp_path
+    if not os.path.exists(actual_path):
+        actual_path = tmp_path + '.abc'
 
-    with open(tmp_path, 'r', encoding='utf-8') as f:
+    with open(actual_path, 'r', encoding='utf-8') as f:
         abc_str = f.read()
 
-    os.unlink(tmp_path)
+    for p in [tmp_path, tmp_path + '.abc']:
+        if os.path.exists(p):
+            os.unlink(p)
+
     return abc_str
 
 
