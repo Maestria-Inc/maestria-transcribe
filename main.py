@@ -1,6 +1,7 @@
 import os
 import tempfile
 import urllib.request
+import json
 from flask import Flask, request, jsonify
 from basic_pitch.inference import predict
 from basic_pitch import ICASSP_2022_MODEL_PATH
@@ -13,25 +14,33 @@ def midi_to_abc(midi_path: str, title: str = "Untitled") -> str:
     """Convert MIDI file to ABC notation using music21."""
     score = music21.converter.parse(midi_path)
 
-    # Keep only the first part (melody) if multiple tracks
+    # Keep only the part with the most notes (melody)
     parts = score.parts
     if len(parts) > 1:
-        # Find the part with the most notes (likely the melody)
         melody = max(parts, key=lambda p: len(p.flat.notes))
         score = music21.stream.Score([melody])
 
-    # Set title
+    # Set metadata
     score.metadata = music21.metadata.Metadata()
     score.metadata.title = title
 
-    # Export to ABC
-    exporter = music21.converter.subConverters.ConverterABC()
-    abc_str = exporter.write(score, fmt='abc', fp=None)
+    # Write to a temp ABC file then read it back
+    with tempfile.NamedTemporaryFile(suffix='.abc', delete=False) as tmp:
+        tmp_path = tmp.name
+
+    score.write('abc', fp=tmp_path)
+
+    with open(tmp_path, 'r', encoding='utf-8') as f:
+        abc_str = f.read()
+
+    os.unlink(tmp_path)
     return abc_str
+
 
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok'})
+
 
 @app.route('/transcribe', methods=['POST'])
 def transcribe():
@@ -45,7 +54,12 @@ def transcribe():
     try:
         # Download audio to temp file
         with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp_audio:
-            urllib.request.urlretrieve(audio_url, tmp_audio.name)
+            req = urllib.request.Request(
+                audio_url,
+                headers={'User-Agent': 'Mozilla/5.0'}
+            )
+            with urllib.request.urlopen(req) as response:
+                tmp_audio.write(response.read())
             audio_path = tmp_audio.name
 
         # Transcribe with Basic Pitch
@@ -54,10 +68,10 @@ def transcribe():
             ICASSP_2022_MODEL_PATH,
             onset_threshold=0.5,
             frame_threshold=0.3,
-            minimum_note_length=58,   # ms — filters out noise
+            minimum_note_length=58,
             minimum_frequency=27.5,   # A0 — lowest piano key
             maximum_frequency=4186.0, # C8 — highest piano key
-            melodia_trick=True,       # improves melody extraction
+            melodia_trick=True,
         )
 
         # Save MIDI to temp file
@@ -69,30 +83,30 @@ def transcribe():
         abc = midi_to_abc(midi_path, title)
 
         # Extract note events for piano animation
-        # Format: [{ pitch, startTime, endTime, velocity }]
         notes = []
         for instrument in midi_data.instruments:
             for note in instrument.notes:
                 notes.append({
-                    'pitch':     note.pitch,       # MIDI note number (0-127)
-                    'startTime': note.start,        # seconds
-                    'endTime':   note.end,           # seconds
-                    'velocity':  note.velocity,      # 0-127
+                    'pitch':     note.pitch,
+                    'startTime': round(note.start, 3),
+                    'endTime':   round(note.end, 3),
+                    'velocity':  note.velocity,
                 })
-        # Sort by start time
         notes.sort(key=lambda n: n['startTime'])
 
-        # Cleanup temp files
+        # Cleanup
         os.unlink(audio_path)
         os.unlink(midi_path)
 
         return jsonify({
             'abc':   abc,
-            'notes': notes,       # used for piano virtual animation
+            'notes': notes,
             'count': len(notes),
         })
 
     except Exception as e:
+        import traceback
+        print(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
 
 
