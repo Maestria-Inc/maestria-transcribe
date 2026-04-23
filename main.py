@@ -178,13 +178,13 @@ def transcribe():
                 tmp_audio.write(response.read())
             audio_path = tmp_audio.name
 
-        # Basic Pitch transcription
+        # Basic Pitch transcription (higher thresholds = fewer ghost notes)
         model_output, midi_data, note_events = predict(
             audio_path,
             ICASSP_2022_MODEL_PATH,
-            onset_threshold=0.5,
-            frame_threshold=0.3,
-            minimum_note_length=58,
+            onset_threshold=0.6,
+            frame_threshold=0.45,
+            minimum_note_length=80,
             minimum_frequency=27.5,
             maximum_frequency=4186.0,
             melodia_trick=True,
@@ -203,7 +203,14 @@ def transcribe():
         notes.sort(key=lambda n: n['startTime'])
 
         # Generate ABC (pure Python)
-        abc = notes_to_abc(notes, title)
+        # Filter weak notes for cleaner score (keep top 60% by velocity)
+        if notes:
+            velocities = sorted([n['velocity'] for n in notes])
+            vel_threshold = velocities[int(len(velocities) * 0.4)]
+            score_notes = [n for n in notes if n['velocity'] >= vel_threshold]
+        else:
+            score_notes = notes
+        abc = notes_to_abc(score_notes, title)
 
         os.unlink(audio_path)
 
@@ -222,3 +229,4 @@ def transcribe():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
+    
