@@ -1,7 +1,6 @@
 import os
 import tempfile
 import urllib.request
-import json
 from flask import Flask, request, jsonify
 from basic_pitch.inference import predict
 from basic_pitch import ICASSP_2022_MODEL_PATH
@@ -11,7 +10,6 @@ import music21
 app = Flask(__name__)
 
 def midi_to_abc(midi_path: str, title: str = "Untitled") -> str:
-    """Convert MIDI file to ABC notation using music21."""
     score = music21.converter.parse(midi_path)
 
     # Keep only the part with the most notes (melody)
@@ -20,27 +18,31 @@ def midi_to_abc(midi_path: str, title: str = "Untitled") -> str:
         melody = max(parts, key=lambda p: len(p.flat.notes))
         score = music21.stream.Score([melody])
 
-    # Set metadata
     score.metadata = music21.metadata.Metadata()
     score.metadata.title = title
 
-    # Write to a temp ABC file then read it back
-    with tempfile.NamedTemporaryFile(suffix='.abc', delete=False) as tmp:
-        tmp_path = tmp.name
+    # music21 always appends .abc — use a fixed known path
+    out_base = '/tmp/maestria_out'
+    out_path = out_base + '.abc'
 
-    # music21.write() returns the actual path (may append .abc to our path)
-    result = score.write('abc', fp=tmp_path)
-    actual_path = str(result) if result and os.path.exists(str(result)) else tmp_path
-    if not os.path.exists(actual_path):
-        actual_path = tmp_path + '.abc'
+    # Remove stale file if exists
+    if os.path.exists(out_path):
+        os.unlink(out_path)
 
-    with open(actual_path, 'r', encoding='utf-8') as f:
+    score.write('abc', fp=out_base)
+
+    # Read the file music21 actually wrote
+    if not os.path.exists(out_path):
+        # Fallback: maybe it wrote without extension
+        if os.path.exists(out_base):
+            out_path = out_base
+        else:
+            return ''
+
+    with open(out_path, 'r', encoding='utf-8') as f:
         abc_str = f.read()
 
-    for p in [tmp_path, tmp_path + '.abc']:
-        if os.path.exists(p):
-            os.unlink(p)
-
+    os.unlink(out_path)
     return abc_str
 
 
@@ -59,7 +61,7 @@ def transcribe():
         return jsonify({'error': 'audioUrl required'}), 400
 
     try:
-        # Download audio to temp file
+        # Download audio
         with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp_audio:
             req = urllib.request.Request(
                 audio_url,
@@ -76,21 +78,20 @@ def transcribe():
             onset_threshold=0.5,
             frame_threshold=0.3,
             minimum_note_length=58,
-            minimum_frequency=27.5,   # A0 — lowest piano key
-            maximum_frequency=4186.0, # C8 — highest piano key
+            minimum_frequency=27.5,
+            maximum_frequency=4186.0,
             melodia_trick=True,
         )
 
-        # Save MIDI to temp file
+        # Save MIDI
         with tempfile.NamedTemporaryFile(suffix='.mid', delete=False) as tmp_midi:
             midi_data.write(tmp_midi.name)
             midi_path = tmp_midi.name
 
-        # Convert MIDI to ABC
+        # Convert MIDI → ABC
         abc = midi_to_abc(midi_path, title)
 
-        # Extract note events for piano animation
-        # Cast all values to native Python types (numpy int64/float32 are not JSON serializable)
+        # Extract notes for piano animation
         notes = []
         for instrument in midi_data.instruments:
             for note in instrument.notes:
@@ -102,7 +103,6 @@ def transcribe():
                 })
         notes.sort(key=lambda n: n['startTime'])
 
-        # Cleanup
         os.unlink(audio_path)
         os.unlink(midi_path)
 
