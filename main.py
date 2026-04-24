@@ -190,27 +190,96 @@ def transcribe():
             melodia_trick=True,
         )
 
-        # Extract notes
-        notes = []
+        # Extract raw notes
+        raw_notes = []
         for instrument in midi_data.instruments:
             for note in instrument.notes:
-                notes.append({
+                raw_notes.append({
                     'pitch':     int(note.pitch),
                     'startTime': round(float(note.start), 3),
                     'endTime':   round(float(note.end), 3),
                     'velocity':  int(note.velocity),
                 })
-        notes.sort(key=lambda n: n['startTime'])
+        raw_notes.sort(key=lambda n: n['startTime'])
 
-        # Generate ABC (pure Python)
-        # Filter weak notes for cleaner score (keep top 60% by velocity)
-        if notes:
-            velocities = sorted([n['velocity'] for n in notes])
-            vel_threshold = velocities[int(len(velocities) * 0.4)]
-            score_notes = [n for n in notes if n['velocity'] >= vel_threshold]
-        else:
-            score_notes = notes
-        abc = notes_to_abc(score_notes, title)
+        # ── Adaptive Smart Filter ──────────────────────────────────────
+        # Adapts to the piece's character instead of using fixed thresholds
+        
+        notes = list(raw_notes)
+        
+        if len(notes) > 0:
+            total_duration = notes[-1]['endTime'] - notes[0]['startTime']
+            notes_per_sec = len(notes) / max(1, total_duration)
+            
+            # 1. Remove micro-notes (artifacts) — duration threshold adapts to density
+            # Dense pieces (études): allow shorter notes (fast passages are real)
+            # Sparse pieces (méditations): longer threshold (short blips are artifacts)
+            if notes_per_sec > 15:      # Very dense (étude, virtuoso)
+                min_dur = 0.03
+            elif notes_per_sec > 8:     # Medium (ballade, prelude)  
+                min_dur = 0.05
+            else:                        # Sparse (méditation, nocturne)
+                min_dur = 0.08
+            notes = [n for n in notes if (n['endTime'] - n['startTime']) >= min_dur]
+            
+            # 2. Concurrency filter — at any moment, a piano can play max ~10 notes
+            # (10 fingers). If we see more, the weakest are artifacts.
+            notes.sort(key=lambda n: n['startTime'])
+            filtered = []
+            for n in notes:
+                # Count how many notes overlap with this one
+                concurrent = [
+                    x for x in filtered
+                    if x['endTime'] > n['startTime'] and x['startTime'] < n['endTime']
+                ]
+                if len(concurrent) < 10:
+                    filtered.append(n)
+                else:
+                    # Too many concurrent — only keep if louder than the weakest current
+                    min_vel = min(c['velocity'] for c in concurrent)
+                    if n['velocity'] > min_vel:
+                        # Replace the weakest
+                        weakest = min(concurrent, key=lambda c: c['velocity'])
+                        filtered.remove(weakest)
+                        filtered.append(n)
+            notes = filtered
+            
+            # 3. Harmonic dedup — if same pitch starts within 40ms, keep louder
+            notes.sort(key=lambda n: (n['pitch'], n['startTime']))
+            deduped = []
+            for n in notes:
+                dup = next(
+                    (d for d in deduped 
+                     if d['pitch'] == n['pitch'] 
+                     and abs(d['startTime'] - n['startTime']) < 0.04),
+                    None
+                )
+                if dup is None:
+                    deduped.append(n)
+                elif n['velocity'] > dup['velocity']:
+                    deduped.remove(dup)
+                    deduped.append(n)
+            notes = sorted(deduped, key=lambda n: n['startTime'])
+            
+            # 4. Isolated note filter — a note far from any other (>0.5s gap both sides)
+            # with low velocity is likely an artifact
+            final = []
+            for i, n in enumerate(notes):
+                prev_end = notes[i-1]['endTime'] if i > 0 else n['startTime']
+                next_start = notes[i+1]['startTime'] if i < len(notes)-1 else n['endTime']
+                gap_before = n['startTime'] - prev_end
+                gap_after = next_start - n['endTime']
+                
+                # If isolated AND weak, skip it
+                if gap_before > 0.5 and gap_after > 0.5 and n['velocity'] < 40:
+                    continue
+                final.append(n)
+            notes = final
+
+        print(f"[transcribe] {len(raw_notes)} raw -> {len(notes)} after smart filter")
+
+        # Generate ABC from filtered notes
+        abc = notes_to_abc(notes, title)
 
         os.unlink(audio_path)
 
