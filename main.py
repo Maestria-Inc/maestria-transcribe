@@ -252,8 +252,8 @@ def transcribe():
         duration = len(audio) / sample_rate
         print(f"[MaestrIA] Audio loaded: {duration:.1f}s at {sample_rate}Hz")
         
-        # Process in chunks to avoid OOM on CPU (max 60s per chunk)
-        CHUNK_SEC = 60
+        # Process in chunks to avoid OOM on CPU (max 30s per chunk)
+        CHUNK_SEC = 30
         OVERLAP_SEC = 2  # overlap to catch notes at boundaries
         all_notes = []
         
@@ -271,6 +271,9 @@ def transcribe():
                         'velocity': note.velocity,
                     })
             try: os.unlink(midi_path)
+            except: pass
+            gc.collect()
+            try: import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None
             except: pass
         else:
             # Chunk processing
