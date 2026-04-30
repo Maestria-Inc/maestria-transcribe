@@ -1,5 +1,5 @@
 [phases.setup]
-aptPkgs = ["ffmpeg", "libsndfile1"]
+aptPkgs = ["ffmpeg", "libsndfile1", "wget"]
 
 [phases.build]
 cmds = ["pip install --no-cache-dir -r requirements.txt"]
