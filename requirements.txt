@@ -8,3 +8,4 @@ piano_transcription_inference==0.0.6
 torch==2.5.1+cpu
 --extra-index-url https://download.pytorch.org/whl/cpu
 soundfile==0.12.1
+setuptools<82
