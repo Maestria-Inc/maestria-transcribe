@@ -5,6 +5,6 @@ librosa==0.10.2
 numpy<2.0
 pretty_midi==0.2.10
 piano_transcription_inference==0.0.6
-torch==2.1.2
---find-links https://download.pytorch.org/whl/cpu/torch_stable.html
+torch==2.5.1+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
 soundfile==0.12.1
