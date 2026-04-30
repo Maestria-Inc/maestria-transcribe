@@ -1,11 +1,5 @@
 [phases.setup]
-nixPkgs = ["python310", "python310Packages.pip", "python310Packages.virtualenv"]
+aptPkgs = ["ffmpeg", "libsndfile1"]
 
-[phases.install]
-cmds = [
-  "python3.10 -m venv /opt/venv",
-  ". /opt/venv/bin/activate && pip install -r requirements.txt"
-]
-
-[start]
-cmd = ". /opt/venv/bin/activate && gunicorn main:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1"
+[phases.build]
+cmds = ["pip install --no-cache-dir -r requirements.txt"]

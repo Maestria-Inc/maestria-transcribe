@@ -1,300 +1,313 @@
+"""
+MaestrIA Piano Transcription Service v2
+========================================
+ByteDance piano_transcription_inference — trained on MAESTRO dataset.
+Replaces Basic Pitch for significantly better piano-specific accuracy.
+
+Endpoint: POST /transcribe { audioUrl, title? }
+Returns:  { notes: [...], abc: "..." }
+
+Each note: { pitch, startTime, endTime, velocity }
+Same format as v1 (Basic Pitch) — drop-in replacement.
+"""
+
 import os
+import json
 import tempfile
-import urllib.request
-import math
+import traceback
 from flask import Flask, request, jsonify
-from basic_pitch.inference import predict
-from basic_pitch import ICASSP_2022_MODEL_PATH
+from flask_cors import CORS
+import requests
+import librosa
+import numpy as np
 import pretty_midi
 
 app = Flask(__name__)
+CORS(app)
+
+# ── Load ByteDance model at startup ──────────────────────────────────────────
+from piano_transcription_inference import PianoTranscription, sample_rate
+
+# Use CPU on Railway (no GPU tier needed for inference on ~2min audio)
+DEVICE = 'cuda' if os.environ.get('USE_CUDA') else 'cpu'
+print(f"[MaestrIA] Loading ByteDance piano transcription model on {DEVICE}...")
+transcriptor = PianoTranscription(device=DEVICE, checkpoint_path=None)
+print("[MaestrIA] Model loaded successfully.")
 
 
-# ── Pure Python MIDI-to-ABC converter (no music21) ─────────────────────────
+# ── ABC generation (pure Python, no music21) ─────────────────────────────────
 
 NOTE_NAMES = ['C', '^C', 'D', '^D', 'E', 'F', '^F', 'G', '^G', 'A', '^A', 'B']
 
 def midi_to_abc_note(midi_pitch):
-    """Convert MIDI pitch to ABC note name."""
-    octave = midi_pitch // 12 - 1  # MIDI 60 = C4
+    """Convert MIDI pitch to ABC notation."""
+    octave = midi_pitch // 12 - 1
     note_idx = midi_pitch % 12
     name = NOTE_NAMES[note_idx]
-
-    # ABC: C4=C  C3=C,  C2=C,,  C5=c  C6=c'
-    if octave <= 4:
-        result = name
-        if octave < 4:
-            result += ',' * (4 - octave)
+    
+    if octave >= 5:
+        # Lowercase for octave 5+
+        base = name[0].lower() if name[0] != '^' else '^' + name[1].lower()
+        extra = octave - 5
+        return base + "'" * extra
+    elif octave == 4:
+        return name
     else:
-        if name.startswith('^'):
-            result = '^' + name[1:].lower()
-        else:
-            result = name.lower()
-        if octave > 5:
-            result += "'" * (octave - 5)
-    return result
+        extra = 4 - octave
+        return name + "," * extra
 
 
-def dur_to_abc(sixteenths):
-    """Duration in 16th-note units to ABC length string (base L:1/16)."""
-    s = max(1, sixteenths)
-    return '' if s == 1 else str(s)
+def quantize_duration(dur_in_sixteenths):
+    """Quantize to nearest musical duration in ABC."""
+    if dur_in_sixteenths <= 0:
+        return '1'  # sixteenth
+    
+    # Map to standard durations
+    if dur_in_sixteenths < 1.5:
+        return ''       # sixteenth (L:1/16 default)
+    elif dur_in_sixteenths < 3:
+        return '2'      # eighth
+    elif dur_in_sixteenths < 5:
+        return '4'      # quarter
+    elif dur_in_sixteenths < 7:
+        return '6'      # dotted quarter
+    elif dur_in_sixteenths < 10:
+        return '8'      # half
+    elif dur_in_sixteenths < 14:
+        return '12'     # dotted half
+    else:
+        return '16'     # whole
 
 
-def notes_to_abc(notes, title="Untitled", tempo=72):
-    """Convert note dicts to renderable ABC notation."""
+def detect_key(notes):
+    """Simple key detection based on pitch class histogram."""
+    if not notes:
+        return 'C'
+    
+    histogram = [0] * 12
+    for n in notes:
+        pc = n['pitch'] % 12
+        weight = (n['endTime'] - n['startTime']) * n['velocity']
+        histogram[pc] += weight
+    
+    # Major key profiles (Krumhansl)
+    major_profile = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
+    key_names = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
+    
+    best_key = 'C'
+    best_corr = -1
+    
+    for shift in range(12):
+        shifted = histogram[shift:] + histogram[:shift]
+        corr = np.corrcoef(shifted, major_profile)[0, 1]
+        if corr > best_corr:
+            best_corr = corr
+            best_key = key_names[shift]
+    
+    return best_key
+
+
+def detect_tempo(notes):
+    """Estimate tempo from onset intervals."""
+    if len(notes) < 10:
+        return 72
+    
+    onsets = sorted(set(round(n['startTime'], 2) for n in notes))
+    if len(onsets) < 5:
+        return 72
+    
+    intervals = [onsets[i+1] - onsets[i] for i in range(min(len(onsets)-1, 100)) if onsets[i+1] - onsets[i] > 0.05]
+    if not intervals:
+        return 72
+    
+    median_interval = sorted(intervals)[len(intervals)//2]
+    
+    # Assume median interval ≈ eighth note
+    bpm = 60.0 / (median_interval * 2)
+    
+    # Clamp to reasonable range
+    while bpm < 40: bpm *= 2
+    while bpm > 180: bpm /= 2
+    
+    return int(round(bpm))
+
+
+def notes_to_abc(notes, title='Untitled', split_threshold=55):
+    """
+    Convert note list to ABC with two staves (treble + bass).
+    Split at MIDI 55 (G3) — standard piano split point.
+    """
     if not notes:
         return ''
-
-    sorted_notes = sorted(notes, key=lambda n: n['startTime'])
-
-    beat_dur = 60.0 / tempo
-    sixteenth = beat_dur / 4.0
-    measure_slots = 16  # 16 sixteenths in 4/4
-
-    # Quantize to 16th-note grid
-    events = {}
-    for n in sorted_notes:
-        slot = round(n['startTime'] / sixteenth)
-        dur = max(1, min(16, round((n['endTime'] - n['startTime']) / sixteenth)))
-        vel = n.get('velocity', 64)
-        if slot not in events:
-            events[slot] = []
-        events[slot].append((n['pitch'], dur, vel))
-
-    if not events:
-        return ''
-
-    # Filter: max 4 notes per chord, keep highest velocity
-    for slot in events:
-        if len(events[slot]) > 4:
-            events[slot].sort(key=lambda x: x[2], reverse=True)
-            events[slot] = events[slot][:4]
-
-    max_slot = max(events.keys())
-
-    # Detect key from most common pitch class
-    pc_counts = {}
-    for n in sorted_notes:
-        pc = n['pitch'] % 12
-        pc_counts[pc] = pc_counts.get(pc, 0) + 1
-    root_pc = max(pc_counts, key=pc_counts.get)
-    key_map = ['C','Db','D','Eb','E','F','F#','G','Ab','A','Bb','B']
-    key = key_map[root_pc]
-
-    header = f'X:1\nT:{title}\nM:4/4\nL:1/16\nQ:1/4={tempo}\nK:{key}\n'
-
-    measures = []
-    slot = 0
-    max_measures = 120
-
-    while slot <= max_slot and len(measures) < max_measures:
-        bar = ''
-        pos = 0
-
-        while pos < measure_slots:
-            if slot > max_slot:
-                # Fill rest of measure
-                remaining = measure_slots - pos
-                if remaining > 0:
-                    bar += 'z' + dur_to_abc(remaining)
-                break
-
-            if slot in events:
-                pitches = events[slot]
-                # Deduplicate by pitch
-                seen = set()
-                unique = []
-                for p, d, v in pitches:
-                    if p not in seen:
-                        seen.add(p)
-                        unique.append((p, d))
-
-                max_d = max(d for _, d in unique)
-                max_d = min(max_d, measure_slots - pos)
-
-                if len(unique) == 1:
-                    p, d = unique[0]
-                    d = min(d, measure_slots - pos)
-                    bar += midi_to_abc_note(p) + dur_to_abc(d)
-                else:
-                    # Sort chord low to high
-                    unique.sort(key=lambda x: x[0])
-                    bar += '[' + ''.join(midi_to_abc_note(p) for p, _ in unique) + ']'
-                    bar += dur_to_abc(max_d)
-
-                pos += max_d
-                slot += max_d
-            else:
-                # Find consecutive rests
-                rest = 0
-                while (slot + rest <= max_slot and
-                       (slot + rest) not in events and
-                       pos + rest < measure_slots):
-                    rest += 1
-                rest = max(1, min(rest, measure_slots - pos))
-                bar += 'z' + dur_to_abc(rest)
-                pos += rest
-                slot += rest
-
-        measures.append(bar)
-
-    # Format: 4 measures per line
-    lines = []
-    for i in range(0, len(measures), 4):
-        chunk = measures[i:i+4]
-        lines.append('|'.join(chunk) + '|')
-
-    body = '\n'.join(lines)
-    body += ']'  # Final barline
-
-    return header + body
+    
+    key = detect_key(notes)
+    tempo = detect_tempo(notes)
+    
+    rh_notes = [n for n in notes if n['pitch'] >= split_threshold]
+    lh_notes = [n for n in notes if n['pitch'] < split_threshold]
+    
+    sec_per_16th = 60.0 / tempo / 4
+    
+    def render_voice(voice_notes):
+        if not voice_notes:
+            return 'z16|'
+        
+        voice_notes.sort(key=lambda n: n['startTime'])
+        measures = []
+        current_measure_ticks = 0
+        measure_content = []
+        ticks_per_measure = 16  # 4/4 time, L:1/16
+        
+        for note in voice_notes:
+            tick = round(note['startTime'] / sec_per_16th)
+            dur_ticks = max(1, round((note['endTime'] - note['startTime']) / sec_per_16th))
+            
+            # Fill gaps with rests
+            gap = tick - current_measure_ticks
+            while gap >= ticks_per_measure:
+                # Fill remaining measure with rest
+                remaining = ticks_per_measure - (current_measure_ticks % ticks_per_measure)
+                if remaining > 0 and remaining < ticks_per_measure:
+                    measure_content.append(f'z{remaining}')
+                measures.append(' '.join(measure_content) if measure_content else f'z{ticks_per_measure}')
+                measure_content = []
+                current_measure_ticks += remaining
+                gap = tick - current_measure_ticks
+            
+            if gap > 0:
+                measure_content.append(f'z{gap}')
+                current_measure_ticks += gap
+            
+            # Add note
+            abc_note = midi_to_abc_note(note['pitch'])
+            dur_str = quantize_duration(dur_ticks)
+            measure_content.append(f'{abc_note}{dur_str}')
+            current_measure_ticks += dur_ticks
+            
+            # Check measure boundary
+            measure_pos = current_measure_ticks % ticks_per_measure
+            if measure_pos == 0 and measure_content:
+                measures.append(' '.join(measure_content))
+                measure_content = []
+        
+        # Flush remaining
+        if measure_content:
+            remaining = ticks_per_measure - (current_measure_ticks % ticks_per_measure)
+            if remaining > 0 and remaining < ticks_per_measure:
+                measure_content.append(f'z{remaining}')
+            measures.append(' '.join(measure_content))
+        
+        # Format: 4 measures per line
+        lines = []
+        for i in range(0, len(measures), 4):
+            chunk = measures[i:i+4]
+            lines.append('|'.join(chunk) + '|')
+        
+        return '\n'.join(lines) if lines else 'z16|'
+    
+    rh_abc = render_voice(rh_notes)
+    lh_abc = render_voice(lh_notes)
+    
+    abc = f"""X:1
+T:{title}
+M:4/4
+L:1/16
+Q:1/4={tempo}
+K:{key}
+V:RH clef=treble
+{rh_abc}
+V:LH clef=bass
+{lh_abc}"""
+    
+    return abc
 
 
-# ── Routes ─────────────────────────────────────────────────────────────────
-
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({'status': 'ok'})
-
+# ── Main transcription endpoint ──────────────────────────────────────────────
 
 @app.route('/transcribe', methods=['POST'])
 def transcribe():
-    data = request.get_json()
+    data = request.json or {}
     audio_url = data.get('audioUrl')
-    title     = data.get('title', 'Untitled')
-
+    title = data.get('title', 'Untitled')
+    
     if not audio_url:
         return jsonify({'error': 'audioUrl required'}), 400
-
+    
     try:
         # Download audio
-        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp_audio:
-            req = urllib.request.Request(
-                audio_url,
-                headers={'User-Agent': 'Mozilla/5.0'}
-            )
-            with urllib.request.urlopen(req) as response:
-                tmp_audio.write(response.read())
-            audio_path = tmp_audio.name
-
-        # Basic Pitch transcription (higher thresholds = fewer ghost notes)
-        model_output, midi_data, note_events = predict(
-            audio_path,
-            ICASSP_2022_MODEL_PATH,
-            onset_threshold=0.6,
-            frame_threshold=0.45,
-            minimum_note_length=80,
-            minimum_frequency=27.5,
-            maximum_frequency=4186.0,
-            melodia_trick=True,
-        )
-
-        # Extract raw notes
-        raw_notes = []
+        print(f"[MaestrIA] Downloading: {audio_url[:80]}...")
+        resp = requests.get(audio_url, timeout=60)
+        resp.raise_for_status()
+        
+        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as f:
+            f.write(resp.content)
+            audio_path = f.name
+        
+        print(f"[MaestrIA] Downloaded {len(resp.content)} bytes")
+        
+        # Load audio at model's expected sample rate
+        audio, _ = librosa.load(audio_path, sr=sample_rate, mono=True)
+        print(f"[MaestrIA] Audio loaded: {len(audio)/sample_rate:.1f}s at {sample_rate}Hz")
+        
+        # Transcribe with ByteDance model
+        midi_path = audio_path.replace('.mp3', '.mid')
+        transcribed_dict = transcriptor.transcribe(audio, midi_path)
+        
+        # Parse the output MIDI for structured notes
+        midi_data = pretty_midi.PrettyMIDI(midi_path)
+        
+        notes = []
         for instrument in midi_data.instruments:
             for note in instrument.notes:
-                raw_notes.append({
-                    'pitch':     int(note.pitch),
-                    'startTime': round(float(note.start), 3),
-                    'endTime':   round(float(note.end), 3),
-                    'velocity':  int(note.velocity),
+                notes.append({
+                    'pitch': note.pitch,
+                    'startTime': round(note.start, 4),
+                    'endTime': round(note.end, 4),
+                    'velocity': note.velocity,
                 })
-        raw_notes.sort(key=lambda n: n['startTime'])
-
-        # ── Adaptive Smart Filter ──────────────────────────────────────
-        # Adapts to the piece's character instead of using fixed thresholds
         
-        notes = list(raw_notes)
+        # Sort by start time
+        notes.sort(key=lambda n: (n['startTime'], n['pitch']))
         
-        if len(notes) > 0:
-            total_duration = notes[-1]['endTime'] - notes[0]['startTime']
-            notes_per_sec = len(notes) / max(1, total_duration)
-            
-            # 1. Remove micro-notes (artifacts) — duration threshold adapts to density
-            # Dense pieces (études): allow shorter notes (fast passages are real)
-            # Sparse pieces (méditations): longer threshold (short blips are artifacts)
-            if notes_per_sec > 15:      # Very dense (étude, virtuoso)
-                min_dur = 0.03
-            elif notes_per_sec > 8:     # Medium (ballade, prelude)  
-                min_dur = 0.05
-            else:                        # Sparse (méditation, nocturne)
-                min_dur = 0.08
-            notes = [n for n in notes if (n['endTime'] - n['startTime']) >= min_dur]
-            
-            # 2. Concurrency filter — at any moment, a piano can play max ~10 notes
-            # (10 fingers). If we see more, the weakest are artifacts.
-            notes.sort(key=lambda n: n['startTime'])
-            filtered = []
-            for n in notes:
-                # Count how many notes overlap with this one
-                concurrent = [
-                    x for x in filtered
-                    if x['endTime'] > n['startTime'] and x['startTime'] < n['endTime']
-                ]
-                if len(concurrent) < 10:
-                    filtered.append(n)
-                else:
-                    # Too many concurrent — only keep if louder than the weakest current
-                    min_vel = min(c['velocity'] for c in concurrent)
-                    if n['velocity'] > min_vel:
-                        # Replace the weakest
-                        weakest = min(concurrent, key=lambda c: c['velocity'])
-                        filtered.remove(weakest)
-                        filtered.append(n)
-            notes = filtered
-            
-            # 3. Harmonic dedup — if same pitch starts within 40ms, keep louder
-            notes.sort(key=lambda n: (n['pitch'], n['startTime']))
-            deduped = []
-            for n in notes:
-                dup = next(
-                    (d for d in deduped 
-                     if d['pitch'] == n['pitch'] 
-                     and abs(d['startTime'] - n['startTime']) < 0.04),
-                    None
-                )
-                if dup is None:
-                    deduped.append(n)
-                elif n['velocity'] > dup['velocity']:
-                    deduped.remove(dup)
-                    deduped.append(n)
-            notes = sorted(deduped, key=lambda n: n['startTime'])
-            
-            # 4. Isolated note filter — a note far from any other (>0.5s gap both sides)
-            # with low velocity is likely an artifact
-            final = []
-            for i, n in enumerate(notes):
-                prev_end = notes[i-1]['endTime'] if i > 0 else n['startTime']
-                next_start = notes[i+1]['startTime'] if i < len(notes)-1 else n['endTime']
-                gap_before = n['startTime'] - prev_end
-                gap_after = next_start - n['endTime']
-                
-                # If isolated AND weak, skip it
-                if gap_before > 0.5 and gap_after > 0.5 and n['velocity'] < 40:
-                    continue
-                final.append(n)
-            notes = final
-
-        print(f"[transcribe] {len(raw_notes)} raw -> {len(notes)} after smart filter")
-
-        # Generate ABC from filtered notes
+        print(f"[MaestrIA] Transcribed: {len(notes)} notes")
+        
+        # Also extract pedal events if available
+        pedal_events = []
+        if hasattr(transcribed_dict, 'get') and 'pedal_events' in transcribed_dict:
+            for evt in transcribed_dict['pedal_events']:
+                pedal_events.append({
+                    'onset': round(evt['onset_time'], 4),
+                    'offset': round(evt['offset_time'], 4),
+                })
+        
+        # Generate ABC notation
         abc = notes_to_abc(notes, title)
-
-        os.unlink(audio_path)
-
+        print(f"[MaestrIA] ABC generated: {len(abc)} chars")
+        
+        # Cleanup temp files
+        try:
+            os.unlink(audio_path)
+            os.unlink(midi_path)
+        except:
+            pass
+        
         return jsonify({
-            'abc':   abc,
             'notes': notes,
-            'count': len(notes),
+            'abc': abc,
+            'pedals': pedal_events,
+            'noteCount': len(notes),
         })
-
+    
     except Exception as e:
-        import traceback
-        print(traceback.format_exc())
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok', 'model': 'bytedance/piano_transcription', 'device': DEVICE})
+
+
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False)

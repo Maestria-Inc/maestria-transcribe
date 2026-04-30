@@ -1,5 +1,10 @@
 flask==3.0.3
-basic-pitch==0.4.0
+flask-cors==4.0.1
+requests==2.31.0
+librosa==0.10.2
+numpy<2.0
 pretty_midi==0.2.10
-gunicorn==22.0.0
-numpy==1.26.4
+piano_transcription_inference==0.0.6
+torch==2.1.2
+--find-links https://download.pytorch.org/whl/cpu/torch_stable.html
+soundfile==0.12.1
