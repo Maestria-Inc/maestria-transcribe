@@ -22,6 +22,8 @@ import librosa
 import numpy as np
 import pretty_midi
 
+import gc
+
 app = Flask(__name__)
 CORS(app)
 
@@ -247,55 +249,93 @@ def transcribe():
         
         # Load audio at model's expected sample rate
         audio, _ = librosa.load(audio_path, sr=sample_rate, mono=True)
-        print(f"[MaestrIA] Audio loaded: {len(audio)/sample_rate:.1f}s at {sample_rate}Hz")
+        duration = len(audio) / sample_rate
+        print(f"[MaestrIA] Audio loaded: {duration:.1f}s at {sample_rate}Hz")
         
-        # Transcribe with ByteDance model
-        midi_path = audio_path.replace('.mp3', '.mid')
-        transcribed_dict = transcriptor.transcribe(audio, midi_path)
+        # Process in chunks to avoid OOM on CPU (max 60s per chunk)
+        CHUNK_SEC = 60
+        OVERLAP_SEC = 2  # overlap to catch notes at boundaries
+        all_notes = []
         
-        # Parse the output MIDI for structured notes
-        midi_data = pretty_midi.PrettyMIDI(midi_path)
+        if duration <= CHUNK_SEC + 10:
+            # Short enough to process in one shot
+            midi_path = audio_path.replace('.mp3', '.mid')
+            transcriptor.transcribe(audio, midi_path)
+            midi_data = pretty_midi.PrettyMIDI(midi_path)
+            for instrument in midi_data.instruments:
+                for note in instrument.notes:
+                    all_notes.append({
+                        'pitch': note.pitch,
+                        'startTime': round(note.start, 4),
+                        'endTime': round(note.end, 4),
+                        'velocity': note.velocity,
+                    })
+            try: os.unlink(midi_path)
+            except: pass
+        else:
+            # Chunk processing
+            chunk_samples = CHUNK_SEC * sample_rate
+            overlap_samples = OVERLAP_SEC * sample_rate
+            step = chunk_samples - overlap_samples
+            n_chunks = max(1, int(np.ceil((len(audio) - overlap_samples) / step)))
+            
+            print(f"[MaestrIA] Processing in {n_chunks} chunks of {CHUNK_SEC}s...")
+            
+            for i in range(n_chunks):
+                start_sample = i * step
+                end_sample = min(start_sample + chunk_samples, len(audio))
+                chunk = audio[start_sample:end_sample]
+                offset_sec = start_sample / sample_rate
+                
+                chunk_midi = audio_path.replace('.mp3', f'_chunk{i}.mid')
+                
+                print(f"[MaestrIA] Chunk {i+1}/{n_chunks}: {offset_sec:.1f}s - {end_sample/sample_rate:.1f}s")
+                
+                try:
+                    transcriptor.transcribe(chunk, chunk_midi)
+                    midi_data = pretty_midi.PrettyMIDI(chunk_midi)
+                    
+                    for instrument in midi_data.instruments:
+                        for note in instrument.notes:
+                            all_notes.append({
+                                'pitch': note.pitch,
+                                'startTime': round(note.start + offset_sec, 4),
+                                'endTime': round(note.end + offset_sec, 4),
+                                'velocity': note.velocity,
+                            })
+                except Exception as chunk_err:
+                    print(f"[MaestrIA] Chunk {i+1} failed: {chunk_err}")
+                finally:
+                    try: os.unlink(chunk_midi)
+                    except: pass
+                    gc.collect()
+            
+            # Deduplicate notes from overlap regions
+            all_notes.sort(key=lambda n: (n['startTime'], n['pitch']))
+            deduped = []
+            for n in all_notes:
+                if not deduped or not (
+                    abs(n['startTime'] - deduped[-1]['startTime']) < 0.05
+                    and n['pitch'] == deduped[-1]['pitch']
+                ):
+                    deduped.append(n)
+            all_notes = deduped
         
-        notes = []
-        for instrument in midi_data.instruments:
-            for note in instrument.notes:
-                notes.append({
-                    'pitch': note.pitch,
-                    'startTime': round(note.start, 4),
-                    'endTime': round(note.end, 4),
-                    'velocity': note.velocity,
-                })
-        
-        # Sort by start time
-        notes.sort(key=lambda n: (n['startTime'], n['pitch']))
-        
-        print(f"[MaestrIA] Transcribed: {len(notes)} notes")
-        
-        # Also extract pedal events if available
-        pedal_events = []
-        if hasattr(transcribed_dict, 'get') and 'pedal_events' in transcribed_dict:
-            for evt in transcribed_dict['pedal_events']:
-                pedal_events.append({
-                    'onset': round(evt['onset_time'], 4),
-                    'offset': round(evt['offset_time'], 4),
-                })
+        print(f"[MaestrIA] Transcribed: {len(all_notes)} notes")
         
         # Generate ABC notation
-        abc = notes_to_abc(notes, title)
+        abc = notes_to_abc(all_notes, title)
         print(f"[MaestrIA] ABC generated: {len(abc)} chars")
         
-        # Cleanup temp files
-        try:
-            os.unlink(audio_path)
-            os.unlink(midi_path)
-        except:
-            pass
+        # Cleanup
+        try: os.unlink(audio_path)
+        except: pass
+        gc.collect()
         
         return jsonify({
-            'notes': notes,
+            'notes': all_notes,
             'abc': abc,
-            'pedals': pedal_events,
-            'noteCount': len(notes),
+            'noteCount': len(all_notes),
         })
     
     except Exception as e:
