@@ -169,58 +169,52 @@ def score_to_musicxml(score):
 
 
 def score_to_pdf(score, task_id):
-    """Export score to PDF via LilyPond. Returns path to PDF file."""
+    """Export score to PDF via LilyPond."""
+    pdf_path = os.path.join(SCORES_DIR, f'{task_id}.pdf')
+    output_base = os.path.join(SCORES_DIR, task_id)  # without .pdf — lilypond adds it
+
     try:
-        pdf_path = os.path.join(SCORES_DIR, f'{task_id}.pdf')
+        # Write LilyPond source file
+        ly_path = os.path.join(SCORES_DIR, f'{task_id}.ly')
+        score.write('lily', fp=ly_path)
 
-        # music21 can write directly to PDF via LilyPond
-        # It creates a .ly file, runs lilypond, produces PDF
-        with tempfile.NamedTemporaryFile(suffix='.ly', delete=False, mode='w') as f:
-            ly_path = f.name
+        # Run LilyPond to produce PDF
+        result = subprocess.run(
+            ['lilypond', '-dno-point-and-click', '--pdf', '-o', output_base, ly_path],
+            capture_output=True, text=True, timeout=120
+        )
 
-        # Write LilyPond format
-        score.write('lily.pdf', fp=pdf_path)
+        # Clean up .ly file
+        try: os.unlink(ly_path)
+        except: pass
 
-        print(f"[Maestria] PDF generated: {pdf_path}")
-        return pdf_path if os.path.exists(pdf_path) else None
+        if os.path.exists(pdf_path):
+            print(f"[Maestria] PDF generated: {pdf_path}")
+            return pdf_path
+
+        print(f"[Maestria] LilyPond failed — stderr: {result.stderr[:500]}")
+        return None
 
     except Exception as e:
         print(f"[Maestria] PDF generation failed: {e}")
         traceback.print_exc()
-
-        # Fallback: try writing ly file and running lilypond manually
-        try:
-            with tempfile.NamedTemporaryFile(suffix='.ly', delete=False, mode='w') as f:
-                ly_path = f.name
-            score.write('lily', fp=ly_path)
-
-            result = subprocess.run(
-                ['lilypond', '-dno-point-and-click', '--pdf', '-o', pdf_path.replace('.pdf', ''), ly_path],
-                capture_output=True, text=True, timeout=60
-            )
-
-            if os.path.exists(pdf_path):
-                print(f"[Maestria] PDF generated (manual fallback): {pdf_path}")
-                return pdf_path
-
-            print(f"[Maestria] LilyPond stderr: {result.stderr[:500]}")
-        except Exception as e2:
-            print(f"[Maestria] Manual LilyPond also failed: {e2}")
-
         return None
 
 
 # ── Also keep simple ABC for backward compatibility ──────────────────────────
 
 def score_to_abc(score):
-    """Try to export ABC from music21. If it fails, return empty string."""
+    """Try to export ABC from music21. Non-critical — MusicXML is primary."""
     try:
-        with tempfile.NamedTemporaryFile(suffix='.abc', delete=False, mode='w') as f:
+        with tempfile.NamedTemporaryFile(suffix='.abc', delete=False) as f:
             abc_path = f.name
-        score.write('abc', fp=abc_path)
+        converter.freeze(score, fmt='abc', fp=abc_path)
         with open(abc_path, 'r') as f:
             abc_text = f.read()
         os.unlink(abc_path)
+        # Validate it's actual ABC, not a Python repr
+        if abc_text.startswith('<') or 'music21' in abc_text:
+            return ''
         return abc_text
     except Exception as e:
         print(f"[Maestria] ABC export failed (non-critical): {e}")
