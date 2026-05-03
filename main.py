@@ -1,8 +1,7 @@
 """
-MaestrIA Piano Transcription Service v2.1
-==========================================
-ByteDance piano_transcription_inference — trained on MAESTRO dataset.
-Async architecture: POST /transcribe returns taskId, GET /status polls result.
+Maestria Piano Transcription Service v3
+========================================
+ByteDance piano_transcription_inference + music21 for notation.
 
 Endpoints:
   POST /transcribe  { audioUrl, title? }  ->  { taskId }
@@ -16,6 +15,7 @@ import uuid
 import tempfile
 import traceback
 import threading
+import subprocess
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests as http_requests
@@ -27,141 +27,147 @@ import gc
 app = Flask(__name__)
 CORS(app)
 
-# ── Task store (in-memory) ───────────────────────────────────────────────────
+# ── Task store ───────────────────────────────────────────────────────────────
 tasks = {}
 
 # ── Load ByteDance model at startup ──────────────────────────────────────────
 from piano_transcription_inference import PianoTranscription, sample_rate
 
 DEVICE = 'cuda' if os.environ.get('USE_CUDA') else 'cpu'
-print(f"[MaestrIA] Loading ByteDance piano transcription model on {DEVICE}...")
+print(f"[Maestria] Loading ByteDance piano transcription model on {DEVICE}...")
 transcriptor = PianoTranscription(device=DEVICE, checkpoint_path=None)
-print("[MaestrIA] Model loaded successfully.")
+print("[Maestria] Model loaded successfully.")
 
-# Lock to prevent concurrent transcriptions (model is not thread-safe)
 transcribe_lock = threading.Lock()
 
+# ── Import music21 ───────────────────────────────────────────────────────────
+import music21
+from music21 import converter, instrument, stream, tempo, key, meter, note, chord
 
-# ── ABC generation ───────────────────────────────────────────────────────────
-
-NOTE_NAMES = ['C', '^C', 'D', '^D', 'E', 'F', '^F', 'G', '^G', 'A', '^A', 'B']
-
-def midi_to_abc_note(midi_pitch):
-    octave = midi_pitch // 12 - 1
-    note_idx = midi_pitch % 12
-    name = NOTE_NAMES[note_idx]
-    if octave >= 5:
-        base = name[0].lower() if name[0] != '^' else '^' + name[1].lower()
-        return base + "'" * (octave - 5)
-    elif octave == 4:
-        return name
-    else:
-        return name + "," * (4 - octave)
+# Configure music21 to use LilyPond if available (optional, for PDF)
+# For ABC output, no external renderer needed
+print("[Maestria] music21 loaded successfully.")
 
 
-def quantize_duration(dur_in_sixteenths):
-    if dur_in_sixteenths <= 0: return '1'
-    if dur_in_sixteenths < 1.5: return ''
-    elif dur_in_sixteenths < 3: return '2'
-    elif dur_in_sixteenths < 5: return '4'
-    elif dur_in_sixteenths < 7: return '6'
-    elif dur_in_sixteenths < 10: return '8'
-    elif dur_in_sixteenths < 14: return '12'
-    else: return '16'
+# ── music21 MIDI → ABC conversion ───────────────────────────────────────────
+
+def midi_to_notation(midi_path, title='Untitled'):
+    """
+    Convert MIDI file to properly quantized ABC notation using music21.
+    Returns ABC string.
+    """
+    try:
+        # Parse MIDI with music21
+        score = converter.parse(midi_path)
+
+        # Set metadata
+        score.metadata = music21.metadata.Metadata()
+        score.metadata.title = title
+        score.metadata.composer = 'Maestria'
+
+        # Quantize — music21 handles this properly
+        # This fixes note alignment, measure boundaries, proper rhythmic values
+        score.quantize(inPlace=True)
+
+        # Split into treble and bass if not already
+        parts = score.parts
+        if len(parts) == 1:
+            # Single track — split by pitch at middle C (MIDI 60)
+            original = parts[0]
+            treble = stream.Part()
+            bass = stream.Part()
+            treble.insert(0, instrument.Piano())
+            bass.insert(0, instrument.Piano())
+
+            for element in original.recurse():
+                if isinstance(element, note.Note):
+                    if element.pitch.midi >= 60:
+                        treble.append(element)
+                    else:
+                        bass.append(element)
+                elif isinstance(element, chord.Chord):
+                    upper = chord.Chord([p for p in element.pitches if p.midi >= 60])
+                    lower = chord.Chord([p for p in element.pitches if p.midi < 60])
+                    if upper.pitches:
+                        upper.quarterLength = element.quarterLength
+                        treble.append(upper)
+                    if lower.pitches:
+                        lower.quarterLength = element.quarterLength
+                        bass.append(lower)
+                elif isinstance(element, (meter.TimeSignature, key.KeySignature, tempo.MetronomeMark)):
+                    treble.append(element)
+                    bass.append(element)
+
+            # Make measures
+            treble.makeMeasures(inPlace=True)
+            bass.makeMeasures(inPlace=True)
+
+            # Set clefs
+            from music21 import clef
+            treble.insert(0, clef.TrebleClef())
+            bass.insert(0, clef.BassClef())
+
+            score = stream.Score()
+            score.metadata = music21.metadata.Metadata()
+            score.metadata.title = title
+            score.metadata.composer = 'Maestria'
+            score.insert(0, treble)
+            score.insert(0, bass)
+
+        # Generate ABC notation
+        abc_text = ''
+        try:
+            # music21 can write ABC directly
+            with tempfile.NamedTemporaryFile(suffix='.abc', delete=False, mode='w') as f:
+                abc_path = f.name
+
+            score.write('abc', fp=abc_path)
+
+            with open(abc_path, 'r') as f:
+                abc_text = f.read()
+
+            os.unlink(abc_path)
+        except Exception as abc_err:
+            print(f"[Maestria] ABC generation via music21 failed: {abc_err}")
+            # Fallback: generate basic ABC from the parsed score
+            abc_text = fallback_abc(score, title)
+
+        return abc_text
+
+    except Exception as e:
+        print(f"[Maestria] music21 conversion failed: {e}")
+        traceback.print_exc()
+        return ''
 
 
-def detect_key(notes):
-    if not notes: return 'C'
-    histogram = [0] * 12
-    for n in notes:
-        pc = n['pitch'] % 12
-        weight = (n['endTime'] - n['startTime']) * n['velocity']
-        histogram[pc] += weight
-    major_profile = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
-    key_names = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
-    best_key, best_corr = 'C', -1
-    for shift in range(12):
-        shifted = histogram[shift:] + histogram[:shift]
-        corr = np.corrcoef(shifted, major_profile)[0, 1]
-        if corr > best_corr:
-            best_corr = corr
-            best_key = key_names[shift]
-    return best_key
+def fallback_abc(score, title='Untitled'):
+    """Simple fallback ABC if music21's ABC writer fails."""
+    try:
+        # Try MusicXML as intermediate
+        with tempfile.NamedTemporaryFile(suffix='.musicxml', delete=False) as f:
+            xml_path = f.name
+        score.write('musicxml', fp=xml_path)
 
+        # Re-parse and try ABC again
+        score2 = converter.parse(xml_path)
+        with tempfile.NamedTemporaryFile(suffix='.abc', delete=False, mode='w') as f:
+            abc_path = f.name
+        score2.write('abc', fp=abc_path)
+        with open(abc_path, 'r') as f:
+            abc_text = f.read()
 
-def detect_tempo(notes):
-    if len(notes) < 10: return 72
-    onsets = sorted(set(round(n['startTime'], 2) for n in notes))
-    if len(onsets) < 5: return 72
-    intervals = [onsets[i+1] - onsets[i] for i in range(min(len(onsets)-1, 100)) if onsets[i+1] - onsets[i] > 0.05]
-    if not intervals: return 72
-    median_interval = sorted(intervals)[len(intervals)//2]
-    bpm = 60.0 / (median_interval * 2)
-    while bpm < 40: bpm *= 2
-    while bpm > 180: bpm /= 2
-    return int(round(bpm))
-
-
-def notes_to_abc(notes, title='Untitled', split_threshold=55):
-    if not notes: return ''
-    key = detect_key(notes)
-    tempo = detect_tempo(notes)
-    rh_notes = [n for n in notes if n['pitch'] >= split_threshold]
-    lh_notes = [n for n in notes if n['pitch'] < split_threshold]
-    sec_per_16th = 60.0 / tempo / 4
-
-    def render_voice(voice_notes):
-        if not voice_notes: return 'z16|'
-        voice_notes.sort(key=lambda n: n['startTime'])
-        measures, measure_content, current_measure_ticks = [], [], 0
-        ticks_per_measure = 16
-        for note in voice_notes:
-            tick = round(note['startTime'] / sec_per_16th)
-            dur_ticks = max(1, round((note['endTime'] - note['startTime']) / sec_per_16th))
-            gap = tick - current_measure_ticks
-            while gap >= ticks_per_measure:
-                remaining = ticks_per_measure - (current_measure_ticks % ticks_per_measure)
-                if 0 < remaining < ticks_per_measure:
-                    measure_content.append(f'z{remaining}')
-                measures.append(' '.join(measure_content) if measure_content else f'z{ticks_per_measure}')
-                measure_content = []
-                current_measure_ticks += remaining
-                gap = tick - current_measure_ticks
-            if gap > 0:
-                measure_content.append(f'z{gap}')
-                current_measure_ticks += gap
-            measure_content.append(f'{midi_to_abc_note(note["pitch"])}{quantize_duration(dur_ticks)}')
-            current_measure_ticks += dur_ticks
-            if current_measure_ticks % ticks_per_measure == 0 and measure_content:
-                measures.append(' '.join(measure_content))
-                measure_content = []
-        if measure_content:
-            remaining = ticks_per_measure - (current_measure_ticks % ticks_per_measure)
-            if 0 < remaining < ticks_per_measure:
-                measure_content.append(f'z{remaining}')
-            measures.append(' '.join(measure_content))
-        lines = []
-        for i in range(0, len(measures), 4):
-            lines.append('|'.join(measures[i:i+4]) + '|')
-        return '\n'.join(lines) if lines else 'z16|'
-
-    return f"""X:1
-T:{title}
-M:4/4
-L:1/16
-Q:1/4={tempo}
-K:{key}
-V:RH clef=treble
-{render_voice(rh_notes)}
-V:LH clef=bass
-{render_voice(lh_notes)}"""
+        os.unlink(xml_path)
+        os.unlink(abc_path)
+        return abc_text
+    except:
+        return f"X:1\nT:{title}\nM:4/4\nL:1/8\nK:C\n|z8|"
 
 
 # ── Background transcription worker ─────────────────────────────────────────
 
 def transcribe_worker(task_id, audio_url, title):
     try:
-        print(f"[MaestrIA] [{task_id[:8]}] Downloading: {audio_url[:80]}...")
+        print(f"[Maestria] [{task_id[:8]}] Downloading: {audio_url[:80]}...")
         resp = http_requests.get(audio_url, timeout=60)
         resp.raise_for_status()
 
@@ -169,39 +175,42 @@ def transcribe_worker(task_id, audio_url, title):
             f.write(resp.content)
             audio_path = f.name
 
-        print(f"[MaestrIA] [{task_id[:8]}] Downloaded {len(resp.content)} bytes")
+        print(f"[Maestria] [{task_id[:8]}] Downloaded {len(resp.content)} bytes")
 
         audio, _ = librosa.load(audio_path, sr=sample_rate, mono=True)
         duration = len(audio) / sample_rate
-        print(f"[MaestrIA] [{task_id[:8]}] Audio: {duration:.1f}s at {sample_rate}Hz")
+        print(f"[Maestria] [{task_id[:8]}] Audio: {duration:.1f}s at {sample_rate}Hz")
 
         midi_path = audio_path.replace('.mp3', '.mid')
-        print(f"[MaestrIA] [{task_id[:8]}] Transcribing...")
+        print(f"[Maestria] [{task_id[:8]}] Transcribing...")
 
         with transcribe_lock:
             transcriptor.transcribe(audio, midi_path)
 
+        # Parse notes for the falling notes display
         midi_data = pretty_midi.PrettyMIDI(midi_path)
         all_notes = []
-        for instrument in midi_data.instruments:
-            for note in instrument.notes:
+        for instr in midi_data.instruments:
+            for n in instr.notes:
                 all_notes.append({
-                    'pitch': note.pitch,
-                    'startTime': round(note.start, 4),
-                    'endTime': round(note.end, 4),
-                    'velocity': note.velocity,
+                    'pitch': n.pitch,
+                    'startTime': round(n.start, 4),
+                    'endTime': round(n.end, 4),
+                    'velocity': n.velocity,
                 })
-
         all_notes.sort(key=lambda n: (n['startTime'], n['pitch']))
 
+        # Generate notation with music21 (uses the MIDI file directly)
+        print(f"[Maestria] [{task_id[:8]}] Generating notation with music21...")
+        abc = midi_to_notation(midi_path, title)
+        print(f"[Maestria] [{task_id[:8]}] Done: {len(all_notes)} notes, {len(abc)} chars ABC")
+
+        # Cleanup
         try: os.unlink(midi_path)
         except: pass
         try: os.unlink(audio_path)
         except: pass
         gc.collect()
-
-        abc = notes_to_abc(all_notes, title)
-        print(f"[MaestrIA] [{task_id[:8]}] Done: {len(all_notes)} notes, {len(abc)} chars ABC")
 
         tasks[task_id] = {
             'status': 'complete',
@@ -214,7 +223,7 @@ def transcribe_worker(task_id, audio_url, title):
 
     except Exception as e:
         traceback.print_exc()
-        print(f"[MaestrIA] [{task_id[:8]}] Failed: {e}")
+        print(f"[Maestria] [{task_id[:8]}] Failed: {e}")
         tasks[task_id] = {
             'status': 'failed',
             'error': str(e),
@@ -269,6 +278,7 @@ def health():
     return jsonify({
         'status': 'ok',
         'model': 'bytedance/piano_transcription',
+        'notation': 'music21',
         'device': DEVICE,
         'active_tasks': sum(1 for t in tasks.values() if t['status'] == 'processing'),
     })
