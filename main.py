@@ -65,92 +65,137 @@ print("[Maestria] music21 loaded.")
 # ── MIDI → music21 Score ─────────────────────────────────────────────────────
 
 def midi_to_score(midi_path, title='Untitled'):
-    """Parse MIDI into a properly formatted music21 Score with two piano staves."""
-    score = converter.parse(midi_path)
-
-    # Quantize for clean rhythmic values
-    score.quantize(inPlace=True)
-
-    parts = score.parts
-
-    if len(parts) <= 1:
-        # Single track — split into treble + bass at middle C
-        original = parts[0] if parts else stream.Part()
-
-        treble_notes = []
-        bass_notes = []
-
-        for el in original.flatten().notesAndRests:
-            if isinstance(el, note.Rest):
-                continue
-            elif isinstance(el, note.Note):
-                if el.pitch.midi >= 60:
-                    treble_notes.append(el)
-                else:
-                    bass_notes.append(el)
-            elif isinstance(el, chord.Chord):
-                upper_pitches = [p for p in el.pitches if p.midi >= 60]
-                lower_pitches = [p for p in el.pitches if p.midi < 60]
-                if upper_pitches:
-                    if len(upper_pitches) == 1:
-                        n = note.Note(upper_pitches[0])
-                        n.offset = el.offset
-                        n.quarterLength = el.quarterLength
-                        treble_notes.append(n)
-                    else:
-                        c = chord.Chord(upper_pitches)
-                        c.offset = el.offset
-                        c.quarterLength = el.quarterLength
-                        treble_notes.append(c)
-                if lower_pitches:
-                    if len(lower_pitches) == 1:
-                        n = note.Note(lower_pitches[0])
-                        n.offset = el.offset
-                        n.quarterLength = el.quarterLength
-                        bass_notes.append(n)
-                    else:
-                        c = chord.Chord(lower_pitches)
-                        c.offset = el.offset
-                        c.quarterLength = el.quarterLength
-                        bass_notes.append(c)
-
-        # Build parts
-        treble = stream.Part()
-        treble.id = 'Piano-RH'
-        treble.insert(0, clef.TrebleClef())
-        treble.insert(0, instrument.Piano())
-        for n in treble_notes:
-            treble.insert(n.offset, n)
-
-        bass = stream.Part()
-        bass.id = 'Piano-LH'
-        bass.insert(0, clef.BassClef())
-        bass.insert(0, instrument.Piano())
-        for n in bass_notes:
-            bass.insert(n.offset, n)
-
-        # Make measures
-        treble.makeMeasures(inPlace=True)
-        bass.makeMeasures(inPlace=True)
-
-        # Detect key and tempo from original
-        try:
-            k = original.analyze('key')
-            treble.measure(1).insert(0, k)
-            bass.measure(1).insert(0, k)
-        except:
-            pass
-
-        score = stream.Score()
-        score.insert(0, treble)
-        score.insert(0, bass)
-
-    # Set metadata
+    """Parse MIDI into a properly formatted piano grand staff Score."""
+    
+    # Parse with pretty_midi for reliable note extraction
+    midi_data = pretty_midi.PrettyMIDI(midi_path)
+    
+    all_midi_notes = []
+    for instr in midi_data.instruments:
+        for n in instr.notes:
+            all_midi_notes.append(n)
+    all_midi_notes.sort(key=lambda n: n.start)
+    
+    if not all_midi_notes:
+        s = stream.Score()
+        s.metadata = music21.metadata.Metadata()
+        s.metadata.title = title
+        s.metadata.composer = 'Maestria'
+        return s
+    
+    # Detect tempo from MIDI
+    tempo_changes = midi_data.get_tempo_changes()
+    bpm = 72
+    if len(tempo_changes[1]) > 0:
+        bpm = int(round(tempo_changes[1][0]))
+    if bpm < 40: bpm = 72
+    if bpm > 200: bpm = 120
+    
+    # Create treble and bass parts
+    treble = stream.Part()
+    treble.id = 'RH'
+    treble.partName = 'Piano'
+    treble.insert(0, clef.TrebleClef())
+    treble.insert(0, instrument.Piano())
+    treble.insert(0, meter.TimeSignature('4/4'))
+    treble.insert(0, tempo.MetronomeMark(number=bpm))
+    
+    bass = stream.Part()
+    bass.id = 'LH'
+    bass.partName = 'Piano'
+    bass.insert(0, clef.BassClef())
+    bass.insert(0, instrument.Piano())
+    bass.insert(0, meter.TimeSignature('4/4'))
+    
+    # Split notes at middle C (MIDI 60)
+    SPLIT = 60
+    
+    # Group simultaneous notes into chords
+    def add_notes_to_part(part, notes_list):
+        """Add notes to a part, grouping simultaneous notes into chords."""
+        if not notes_list:
+            return
+        
+        # Group by onset time (within 30ms tolerance)
+        groups = []
+        current_group = [notes_list[0]]
+        
+        for n in notes_list[1:]:
+            if abs(n.start - current_group[0].start) < 0.03:
+                current_group.append(n)
+            else:
+                groups.append(current_group)
+                current_group = [n]
+        groups.append(current_group)
+        
+        for group in groups:
+            onset = group[0].start
+            offset_ql = onset * (bpm / 60.0)  # Convert seconds to quarter lengths
+            
+            if len(group) == 1:
+                n = group[0]
+                dur = max(0.125, n.end - n.start)
+                dur_ql = dur * (bpm / 60.0)
+                
+                m21_note = note.Note(n.pitch)
+                m21_note.quarterLength = _quantize_ql(dur_ql)
+                m21_note.volume.velocity = n.velocity
+                part.insert(offset_ql, m21_note)
+            else:
+                # Chord
+                pitches = [n.pitch for n in group]
+                dur = max(0.125, max(n.end - n.start for n in group))
+                dur_ql = dur * (bpm / 60.0)
+                
+                m21_chord = chord.Chord(pitches)
+                m21_chord.quarterLength = _quantize_ql(dur_ql)
+                part.insert(offset_ql, m21_chord)
+    
+    # Split notes
+    treble_notes = [n for n in all_midi_notes if n.pitch >= SPLIT]
+    bass_notes = [n for n in all_midi_notes if n.pitch < SPLIT]
+    
+    add_notes_to_part(treble, treble_notes)
+    add_notes_to_part(bass, bass_notes)
+    
+    # Make proper measures
+    treble.makeMeasures(inPlace=True)
+    bass.makeMeasures(inPlace=True)
+    
+    # Quantize for clean notation
+    treble.quantize(inPlace=True)
+    bass.quantize(inPlace=True)
+    
+    # Detect key
+    try:
+        k = treble.analyze('key')
+        treble.measure(1).insert(0, k)
+        bass.measure(1).insert(0, k)
+    except:
+        pass
+    
+    # Build score with proper piano layout
+    score = stream.Score()
     score.metadata = music21.metadata.Metadata()
     score.metadata.title = title
     score.metadata.composer = 'Maestria'
-
+    
+    # Create a StaffGroup for piano grand staff (brace)
+    from music21 import layout
+    sg = layout.StaffGroup([treble, bass], symbol='brace', barTogether=True)
+    
+    score.insert(0, treble)
+    score.insert(0, bass)
+    score.insert(0, sg)
+    
     return score
+
+
+def _quantize_ql(ql):
+    """Quantize quarter length to nearest standard musical duration."""
+    standard = [0.125, 0.25, 0.375, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0]
+    closest = min(standard, key=lambda s: abs(s - ql))
+    return closest
 
 
 def score_to_musicxml(score):
