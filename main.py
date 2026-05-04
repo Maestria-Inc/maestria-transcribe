@@ -187,42 +187,57 @@ def score_to_pdf(score, task_id):
         # Write LilyPond source
         score.write('lily', fp=ly_path)
 
-        # Read and inject layout directives
+        # Read the generated file
         with open(ly_path, 'r', encoding='utf-8', errors='replace') as f:
             ly_content = f.read()
 
-        # Add paper and layout blocks for proper formatting
-        layout_block = r"""
+        # Debug: log first 200 chars to understand structure
+        print(f"[Maestria] LY file start: {ly_content[:200]}")
+
+        # Inject paper block right at the top of the file
+        paper_block = r'''
 \paper {
   indent = 15\mm
   short-indent = 5\mm
-  top-margin = 15\mm
-  bottom-margin = 15\mm
-  left-margin = 15\mm
-  right-margin = 15\mm
+  top-margin = 12\mm
+  bottom-margin = 12\mm
+  left-margin = 12\mm
+  right-margin = 12\mm
+  system-system-spacing = #'((basic-distance . 18) (padding . 4))
   ragged-last-bottom = ##t
-  system-system-spacing.basic-distance = #16
-  markup-system-spacing.basic-distance = #12
 }
-
-\layout {
-  \context {
-    \Score
-    \override SpacingSpanner.common-shortest-duration = #(ly:make-moment 1/8)
+'''
+        # Inject layout inside every \score block
+        layout_block = r'''
+  \layout {
+    \context {
+      \Score
+      \override SpacingSpanner.common-shortest-duration = #(ly:make-moment 1/16)
+    }
   }
-}
+'''
+        # Add paper at the very top
+        ly_content = paper_block + '\n' + ly_content
 
+        # Add \layout inside \score blocks (before the closing brace)
+        # music21 generates: \score { \new StaffGroup ... }
+        # We need: \score { \new StaffGroup ... \layout { ... } }
+        if '\\score' in ly_content and '\\layout' not in ly_content:
+            # Find the last } of each \score block and insert \layout before it
+            import re
+            # Simple approach: add layout before the very last }
+            last_brace = ly_content.rfind('}')
+            if last_brace > 0:
+                ly_content = ly_content[:last_brace] + layout_block + '\n' + ly_content[last_brace:]
+
+        # Add header/tagline
+        if '\\header' not in ly_content:
+            header_block = r'''
 \header {
   tagline = "© 2026 Maestria — Original Composition"
 }
-"""
-        # Insert layout before the first \score or \new block
-        if '\\score' in ly_content:
-            ly_content = layout_block + '\n' + ly_content
-        elif '\\new' in ly_content:
-            ly_content = layout_block + '\n' + ly_content
-        else:
-            ly_content = layout_block + '\n' + ly_content
+'''
+            ly_content = ly_content.replace(paper_block, paper_block + header_block)
 
         with open(ly_path, 'w', encoding='utf-8') as f:
             f.write(ly_content)
