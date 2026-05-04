@@ -214,6 +214,10 @@ def score_to_pdf(score, task_id):
         with open(ly_path, 'r', encoding='utf-8', errors='replace') as f:
             ly_content = f.read()
 
+        # Log structure for debugging
+        print(f"[Maestria] LY file length: {len(ly_content)}")
+        print(f"[Maestria] LY first 800 chars:\n{ly_content[:800]}")
+
         # CRITICAL: Remove lilypond-book-preamble — it overrides page layout
         # and forces compact single-system formatting
         ly_content = ly_content.replace('\\include "lilypond-book-preamble.ly"', '')
