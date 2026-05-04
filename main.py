@@ -193,7 +193,9 @@ def midi_to_score(midi_path, title='Untitled'):
 
 def _quantize_ql(ql):
     """Quantize quarter length to nearest standard musical duration."""
-    standard = [0.125, 0.25, 0.375, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0]
+    standard = [0.25, 0.375, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0]
+    if ql < 0.125:
+        return 0.25  # minimum: sixteenth note
     closest = min(standard, key=lambda s: abs(s - ql))
     return closest
 
@@ -214,16 +216,56 @@ def score_to_musicxml(score):
 
 
 def score_to_pdf(score, task_id):
-    """Export score to PDF via LilyPond."""
+    """Export score to PDF via LilyPond with proper page layout."""
     pdf_path = os.path.join(SCORES_DIR, f'{task_id}.pdf')
-    output_base = os.path.join(SCORES_DIR, task_id)  # without .pdf — lilypond adds it
+    output_base = os.path.join(SCORES_DIR, task_id)
+    ly_path = os.path.join(SCORES_DIR, f'{task_id}.ly')
 
     try:
-        # Write LilyPond source file
-        ly_path = os.path.join(SCORES_DIR, f'{task_id}.ly')
+        # Write LilyPond source
         score.write('lily', fp=ly_path)
 
-        # Run LilyPond to produce PDF
+        # Read and inject layout directives
+        with open(ly_path, 'r', encoding='utf-8', errors='replace') as f:
+            ly_content = f.read()
+
+        # Add paper and layout blocks for proper formatting
+        layout_block = r"""
+\paper {
+  indent = 15\mm
+  short-indent = 5\mm
+  top-margin = 15\mm
+  bottom-margin = 15\mm
+  left-margin = 15\mm
+  right-margin = 15\mm
+  ragged-last-bottom = ##t
+  system-system-spacing.basic-distance = #16
+  markup-system-spacing.basic-distance = #12
+}
+
+\layout {
+  \context {
+    \Score
+    \override SpacingSpanner.common-shortest-duration = #(ly:make-moment 1/8)
+  }
+}
+
+\header {
+  tagline = "© 2026 Maestria — Original Composition"
+}
+"""
+        # Insert layout before the first \score or \new block
+        if '\\score' in ly_content:
+            ly_content = layout_block + '\n' + ly_content
+        elif '\\new' in ly_content:
+            ly_content = layout_block + '\n' + ly_content
+        else:
+            ly_content = layout_block + '\n' + ly_content
+
+        with open(ly_path, 'w', encoding='utf-8') as f:
+            f.write(ly_content)
+
+        # Run LilyPond
         result = subprocess.run(
             ['lilypond', '-dno-point-and-click', '--pdf', '-o', output_base, ly_path],
             capture_output=True, text=True, timeout=120
