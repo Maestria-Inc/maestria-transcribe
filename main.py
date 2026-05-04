@@ -191,53 +191,39 @@ def score_to_pdf(score, task_id):
         with open(ly_path, 'r', encoding='utf-8', errors='replace') as f:
             ly_content = f.read()
 
-        # Debug: log first 200 chars to understand structure
-        print(f"[Maestria] LY file start: {ly_content[:200]}")
+        # CRITICAL: Remove lilypond-book-preamble — it overrides page layout
+        # and forces compact single-system formatting
+        ly_content = ly_content.replace('\\include "lilypond-book-preamble.ly"', '')
 
-        # Inject paper block right at the top of the file
-        paper_block = r'''
+        # Also remove the color function definition that music21 adds (unnecessary)
+        import re
+        ly_content = re.sub(r'color = #\(define-music-function.*?\n.*?\n.*?\n', '', ly_content, flags=re.DOTALL)
+
+        # Inject paper and layout right after \version
+        paper_and_layout = r"""
 \paper {
-  indent = 15\mm
+  #(set-paper-size "a4")
+  indent = 12\mm
   short-indent = 5\mm
-  top-margin = 12\mm
-  bottom-margin = 12\mm
-  left-margin = 12\mm
-  right-margin = 12\mm
-  system-system-spacing = #'((basic-distance . 18) (padding . 4))
+  top-margin = 15\mm
+  bottom-margin = 15\mm
+  left-margin = 15\mm
+  right-margin = 15\mm
+  system-system-spacing = #'((basic-distance . 16) (padding . 3))
+  score-markup-spacing = #'((basic-distance . 12))
   ragged-last-bottom = ##t
 }
-'''
-        # Inject layout inside every \score block
-        layout_block = r'''
-  \layout {
-    \context {
-      \Score
-      \override SpacingSpanner.common-shortest-duration = #(ly:make-moment 1/16)
-    }
-  }
-'''
-        # Add paper at the very top
-        ly_content = paper_block + '\n' + ly_content
 
-        # Add \layout inside \score blocks (before the closing brace)
-        # music21 generates: \score { \new StaffGroup ... }
-        # We need: \score { \new StaffGroup ... \layout { ... } }
-        if '\\score' in ly_content and '\\layout' not in ly_content:
-            # Find the last } of each \score block and insert \layout before it
-            import re
-            # Simple approach: add layout before the very last }
-            last_brace = ly_content.rfind('}')
-            if last_brace > 0:
-                ly_content = ly_content[:last_brace] + layout_block + '\n' + ly_content[last_brace:]
-
-        # Add header/tagline
-        if '\\header' not in ly_content:
-            header_block = r'''
 \header {
-  tagline = "© 2026 Maestria — Original Composition"
+  tagline = \markup { \small \italic "© 2026 Maestria — Original Composition" }
 }
-'''
-            ly_content = ly_content.replace(paper_block, paper_block + header_block)
+"""
+        # Insert after \version line
+        version_end = ly_content.find('\n', ly_content.find('\\version'))
+        if version_end > 0:
+            ly_content = ly_content[:version_end+1] + paper_and_layout + ly_content[version_end+1:]
+        else:
+            ly_content = paper_and_layout + ly_content
 
         with open(ly_path, 'w', encoding='utf-8') as f:
             f.write(ly_content)
