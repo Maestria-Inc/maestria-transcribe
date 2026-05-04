@@ -92,48 +92,71 @@ def midi_to_score(midi_path, title='Untitled'):
         
         treble = stream.Part()
         treble.id = 'RH'
-        treble.insert(0, clef.TrebleClef())
+        treble.partName = 'Piano'
         treble.insert(0, instrument.Piano())
         
         bass = stream.Part()
-        bass.id = 'LH'  
-        bass.insert(0, clef.BassClef())
+        bass.id = 'LH'
+        bass.partName = 'Piano'
         bass.insert(0, instrument.Piano())
         
+        first_measure = True
         for m in original.getElementsByClass(stream.Measure):
             tm = stream.Measure(number=m.number)
             bm = stream.Measure(number=m.number)
+            
+            # Force clefs on every measure to prevent LilyPond from losing them
+            if first_measure:
+                tm.insert(0, clef.TrebleClef())
+                bm.insert(0, clef.BassClef())
+                # Copy time signature and tempo
+                for sig in m.getElementsByClass(meter.TimeSignature):
+                    tm.insert(0, sig)
+                    bm.insert(0, sig)
+                for t in m.getElementsByClass(tempo.MetronomeMark):
+                    tm.insert(0, t)
+                first_measure = False
+            
+            has_treble = False
+            has_bass = False
             
             for el in m.notesAndRests:
                 if isinstance(el, note.Rest):
                     continue
                 elif isinstance(el, note.Note):
-                    n_copy = el.transpose(0)  # deep copy
+                    n_copy = note.Note(el.pitch, quarterLength=el.quarterLength)
+                    n_copy.offset = el.offset
                     if el.pitch.midi >= 60:
                         tm.insert(el.offset, n_copy)
+                        has_treble = True
                     else:
                         bm.insert(el.offset, n_copy)
+                        has_bass = True
                 elif isinstance(el, chord.Chord):
                     upper = [p for p in el.pitches if p.midi >= 60]
                     lower = [p for p in el.pitches if p.midi < 60]
                     if upper:
-                        c = chord.Chord(upper)
-                        c.quarterLength = el.quarterLength
+                        c = chord.Chord(upper, quarterLength=el.quarterLength)
                         tm.insert(el.offset, c)
+                        has_treble = True
                     if lower:
-                        c = chord.Chord(lower)
-                        c.quarterLength = el.quarterLength
+                        c = chord.Chord(lower, quarterLength=el.quarterLength)
                         bm.insert(el.offset, c)
+                        has_bass = True
             
-            # Copy time signature, key signature, tempo from first measure
-            for sig in m.getElementsByClass((meter.TimeSignature, key.KeySignature, tempo.MetronomeMark)):
-                tm.insert(sig.offset, sig)
-                bm.insert(sig.offset, sig)
+            # Add rest-filled measures if one hand is empty
+            # This keeps both staves aligned
+            if not has_treble:
+                r = note.Rest(quarterLength=4.0)
+                tm.insert(0, r)
+            if not has_bass:
+                r = note.Rest(quarterLength=4.0)
+                bm.insert(0, r)
             
             treble.append(tm)
             bass.append(bm)
         
-        # Build new score
+        # Build new score with StaffGroup
         from music21 import layout
         score = stream.Score()
         score.metadata = music21.metadata.Metadata()
