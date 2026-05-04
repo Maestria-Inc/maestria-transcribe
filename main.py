@@ -240,6 +240,18 @@ def score_to_pdf(score, task_id):
 \header {
   tagline = \markup { \small \italic "© 2026 Maestria — Original Composition" }
 }
+
+\layout {
+  \context {
+    \Staff
+    \override VerticalAxisGroup.remove-empty = ##f
+    \override VerticalAxisGroup.remove-first = ##f
+  }
+  \context {
+    \Score
+    \override SpacingSpanner.common-shortest-duration = #(ly:make-moment 1/16)
+  }
+}
 """
         # Insert after \version line
         version_end = ly_content.find('\n', ly_content.find('\\version'))
