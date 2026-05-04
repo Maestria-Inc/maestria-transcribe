@@ -166,6 +166,16 @@ def midi_to_score(midi_path, title='Untitled'):
     treble.quantize(inPlace=True)
     bass.quantize(inPlace=True)
     
+    # Post-quantization cleanup: remove or fix notes with impossibly short durations
+    MIN_QL = 0.25  # minimum sixteenth note
+    for part in [treble, bass]:
+        for el in list(part.flatten().notesAndRests):
+            if hasattr(el, 'quarterLength') and el.quarterLength < MIN_QL:
+                if el.quarterLength > 0:
+                    el.quarterLength = MIN_QL  # promote to sixteenth
+                else:
+                    part.remove(el, recurse=True)  # remove zero-length
+    
     # Detect key
     try:
         k = treble.analyze('key')
