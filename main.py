@@ -224,10 +224,45 @@ def score_to_pdf(score, task_id):
 
         # Also remove the color function definition that music21 adds (unnecessary)
         import re
-        ly_content = re.sub(r'color = #\(define-music-function.*?\n.*?\n.*?\n', '', ly_content, flags=re.DOTALL)
+        ly_content = re.sub(r'color = #\(define-music-function.*?#\}\)', '', ly_content, flags=re.DOTALL)
 
-        # Inject paper and layout right after \version
-        paper_and_layout = r"""
+        # Replace \new Staff constructs with \new PianoStaff << ... >>
+        # Current structure: \score { << \new Staff = RH { ... } \new Staff = LH { ... } >> }
+        # Target:  \score { \new PianoStaff << \new Staff = RH { ... } \new Staff = LH { ... } >> \layout { ... } }
+        
+        # Wrap the << >> inside \score with \new PianoStaff
+        ly_content = ly_content.replace(
+            '\\score  { \n      <<',
+            '\\score  { \n      \\new PianoStaff <<'
+        )
+        # Also try without extra spaces
+        ly_content = ly_content.replace(
+            '\\score  {\n      <<',
+            '\\score  {\n      \\new PianoStaff <<'
+        )
+        ly_content = ly_content.replace(
+            '\\score { \n<<',
+            '\\score { \n\\new PianoStaff <<'
+        )
+
+        # Inject \layout block inside \score, before the final closing }
+        layout_inside_score = r"""
+  \layout {
+    \context {
+      \Staff
+      \RemoveEmptyStaves
+      \override VerticalAxisGroup.remove-empty = ##f
+      \override VerticalAxisGroup.remove-first = ##f
+    }
+  }
+"""
+        # Find the last } which closes the \score block
+        last_brace = ly_content.rfind('}')
+        if last_brace > 0:
+            ly_content = ly_content[:last_brace] + layout_inside_score + ly_content[last_brace:]
+
+        # Paper and header go at top level (after \version)
+        paper_block = r"""
 \paper {
   #(set-paper-size "a4")
   indent = 12\mm
@@ -237,32 +272,20 @@ def score_to_pdf(score, task_id):
   left-margin = 15\mm
   right-margin = 15\mm
   system-system-spacing = #'((basic-distance . 16) (padding . 3))
-  score-markup-spacing = #'((basic-distance . 12))
   ragged-last-bottom = ##t
 }
-
-\header {
-  tagline = \markup { \small \italic "© 2026 Maestria — Original Composition" }
-}
-
-\layout {
-  \context {
-    \Staff
-    \override VerticalAxisGroup.remove-empty = ##f
-    \override VerticalAxisGroup.remove-first = ##f
-  }
-  \context {
-    \Score
-    \override SpacingSpanner.common-shortest-duration = #(ly:make-moment 1/16)
-  }
-}
 """
-        # Insert after \version line
+        # Replace the music21 \header with our version
+        ly_content = re.sub(
+            r'\\header\s*\{[^}]*\}',
+            r'\\header {\n  title = "' + title.replace('"', '\\"') + r'"\n  composer = "Maestria"\n  tagline = \\markup { \\small \\italic "© 2026 Maestria — Original Composition" }\n}',
+            ly_content
+        )
+
+        # Insert paper after \version line
         version_end = ly_content.find('\n', ly_content.find('\\version'))
         if version_end > 0:
-            ly_content = ly_content[:version_end+1] + paper_and_layout + ly_content[version_end+1:]
-        else:
-            ly_content = paper_and_layout + ly_content
+            ly_content = ly_content[:version_end+1] + paper_block + ly_content[version_end+1:]
 
         with open(ly_path, 'w', encoding='utf-8') as f:
             f.write(ly_content)
