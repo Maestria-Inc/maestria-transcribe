@@ -200,7 +200,7 @@ def score_to_musicxml(score):
         return ''
 
 
-def score_to_pdf(score, task_id):
+def score_to_pdf(score, task_id, title='Untitled'):
     """Export score to PDF via LilyPond with proper page layout."""
     pdf_path = os.path.join(SCORES_DIR, f'{task_id}.pdf')
     output_base = os.path.join(SCORES_DIR, task_id)
@@ -381,7 +381,7 @@ def transcribe_worker(task_id, audio_url, title):
         abc = score_to_abc(score)
 
         # PDF generation
-        pdf_path = score_to_pdf(score, task_id)
+        pdf_path = score_to_pdf(score, task_id, title)
         has_pdf = pdf_path is not None and os.path.exists(pdf_path)
         print(f"[Maestria] [{task_id[:8]}] PDF: {'yes' if has_pdf else 'no'}")
 
