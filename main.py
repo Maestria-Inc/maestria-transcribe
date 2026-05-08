@@ -20,7 +20,7 @@ Outputs:
   - pdf_url — served from this service for download
 
 Endpoints:
-  POST /transcribe  { audioUrl, title? }  ->  { taskId }
+  POST /transcribe  { audioUrl, title? }  ->  { taskId}
   GET  /status?taskId=X                   ->  { status, notes?, musicxml?, noteCount? }
   GET  /score/:taskId.pdf                 ->  PDF file
   GET  /health
