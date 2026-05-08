@@ -210,30 +210,27 @@ def postprocess_midi(midi_path, audio_path=None):
 
     print(f"[Maestria] After filtering: {len(all_notes)} notes")
 
-    # ── Step 7: Split into two tracks (RH / LH) ──
+    # ── Step 5: Write single-track MIDI ──
+    # One instrument, one track. MuseScore will auto-split into grand staff
+    # using its own dynamic split-point algorithm — this produces a proper
+    # PianoStaff with brace instead of two separate instruments.
     clean_midi = pretty_midi.PrettyMIDI(initial_tempo=tempo)
-
-    rh_inst = pretty_midi.Instrument(program=0, name='Piano RH')
-    lh_inst = pretty_midi.Instrument(program=0, name='Piano LH')
+    piano = pretty_midi.Instrument(program=0, name='Piano')
 
     for n in all_notes:
-        note_copy = pretty_midi.Note(
+        piano.notes.append(pretty_midi.Note(
             velocity=n.velocity, pitch=n.pitch,
             start=n.start, end=n.end
-        )
-        if n.pitch >= SPLIT_POINT:
-            rh_inst.notes.append(note_copy)
-        else:
-            lh_inst.notes.append(note_copy)
+        ))
 
-    clean_midi.instruments.append(rh_inst)
-    clean_midi.instruments.append(lh_inst)
+    clean_midi.instruments.append(piano)
 
     clean_path = midi_path.replace('.mid', '_clean.mid')
     clean_midi.write(clean_path)
 
-    total = len(rh_inst.notes) + len(lh_inst.notes)
-    print(f"[Maestria] Post-processed: {total} notes (RH={len(rh_inst.notes)}, LH={len(lh_inst.notes)}), tempo={tempo:.0f}")
+    rh_count = sum(1 for n in all_notes if n.pitch >= SPLIT_POINT)
+    lh_count = len(all_notes) - rh_count
+    print(f"[Maestria] Post-processed: {len(all_notes)} notes (RH≈{rh_count}, LH≈{lh_count}), tempo={tempo:.0f}")
 
     return clean_path, tempo
 
