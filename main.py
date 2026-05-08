@@ -1,7 +1,7 @@
 """
-Maestria Piano Transcription Service v4.2
+Maestria Piano Transcription Service v4.3
 ==========================================
-ByteDance transcription + post-processing + MuseScore PDF.
+ByteDance transcription + post-processing + MuseScore PDF + Supabase Storage.
 
 Pipeline:
   ByteDance AMT → MIDI brut
@@ -10,19 +10,15 @@ Pipeline:
        ↓
   pretty_midi → JSON notes (for falling notes in app)
        ↓
-  MuseScore (MIDI → PDF directly — handles quantization, hand split, layout)
+  MuseScore (MIDI → PDF directly)
        ↓
-  Partitura → MusicXML (optional, for in-app OSMD — non-blocking if it fails)
-
-Outputs:
-  - notes (JSON) — for falling notes display (post-processed)
-  - musicxml (string) — for in-app OSMD rendering (best-effort)
-  - pdf_url — served from this service for download
+  Upload PDF to Supabase Storage → permanent public URL
+       ↓
+  Partitura → MusicXML (optional, best-effort)
 
 Endpoints:
-  POST /transcribe  { audioUrl, title? }  ->  { taskId }
-  GET  /status?taskId=X                   ->  { status, notes?, musicxml?, noteCount? }
-  GET  /score/:taskId.pdf                 ->  PDF file
+  POST /transcribe  { audioUrl, title?, compositionId? }  ->  { taskId }
+  GET  /status?taskId=X  ->  { status, notes?, noteCount?, scorePdfUrl?, hasPdf? }
   GET  /health
 """
 
@@ -32,7 +28,7 @@ import tempfile
 import traceback
 import threading
 import subprocess
-from flask import Flask, request, jsonify, send_file, abort
+from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
 import requests as http_requests
 import librosa
@@ -46,6 +42,20 @@ CORS(app)
 tasks = {}
 SCORES_DIR = tempfile.mkdtemp(prefix='maestria_scores_')
 
+# ── Supabase client ──────────────────────────────────────────────────────────
+from supabase import create_client
+
+SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
+SUPABASE_SERVICE_KEY = os.environ.get('SUPABASE_SERVICE_KEY', '')
+SCORE_BUCKET = 'scores'
+
+if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    print(f"[Maestria] Supabase connected: {SUPABASE_URL[:40]}...")
+else:
+    supabase = None
+    print("[Maestria] WARNING: Supabase not configured — PDF upload disabled")
+
 # ── Load ByteDance model ─────────────────────────────────────────────────────
 from piano_transcription_inference import PianoTranscription, sample_rate
 
@@ -56,7 +66,7 @@ print("[Maestria] Model loaded.")
 
 transcribe_lock = threading.Lock()
 
-# ── Load Partitura (optional — for MusicXML only) ───────────────────────────
+# ── Load Partitura (optional) ────────────────────────────────────────────────
 try:
     import partitura as pt
     print("[Maestria] Partitura loaded.")
@@ -83,16 +93,15 @@ if not mscore_cmd:
 
 def postprocess_midi(midi_path, audio_path=None):
     """
-    Clean up ByteDance MIDI output and split into RH/LH tracks.
+    Clean up ByteDance MIDI output.
 
-    Constraints applied:
+    Constraints:
     - Ghost notes filtered (velocity < 35)
     - Micro-notes filtered (< 40ms)
     - Duration clamped (tempo-aware)
-    - Max 4 simultaneous onset notes per hand
-    - Hand span max 15 semitones (a 10th) per chord
-    - Max 3 sustained notes per hand at any time
-    - Split into RH/LH tracks for MuseScore
+    - Max 3 sounding notes per hand at any time
+    - Hand span max 15 semitones per sounding chord
+    - Single-track output for MuseScore grand staff
 
     Returns (clean_midi_path, detected_tempo).
     """
@@ -165,44 +174,33 @@ def postprocess_midi(midi_path, audio_path=None):
                 n.end = n.start + 0.05
 
     # ── Step 4: Unified playability filter ──
-    # Single pass: for each note, check against ALL currently sounding notes
-    # in the same hand. Enforce:
-    #   - Max 3 notes sounding at once per hand
-    #   - Max span of 15 semitones within sounding notes of same hand
-    #   - Deduplicate same pitch within 40ms
     MAX_SOUNDING = 3
-    MAX_SPAN = 15  # semitones — a 10th
+    MAX_SPAN = 15
     SPLIT_POINT = 60
 
     all_notes.sort(key=lambda n: (n.start, -n.velocity))
 
-    accepted = []  # notes that passed all checks
+    accepted = []
     seen_dedup = set()
 
     for n in all_notes:
-        # Dedup: skip if same pitch within 40ms already accepted
         dedup_key = (n.pitch, round(n.start * 25))
         if dedup_key in seen_dedup:
             continue
 
         is_rh = n.pitch >= SPLIT_POINT
-
-        # Find all accepted notes in same hand that are still sounding at n.start
         active = [a for a in accepted
                   if a.end > n.start and (a.pitch >= SPLIT_POINT) == is_rh]
 
-        # Check 1: count
         if len(active) >= MAX_SOUNDING:
             continue
 
-        # Check 2: span — would adding this note create an unplayable stretch?
         if active:
             pitches = [a.pitch for a in active] + [n.pitch]
             span = max(pitches) - min(pitches)
             if span > MAX_SPAN:
                 continue
 
-        # Note passes all checks
         accepted.append(n)
         seen_dedup.add(dedup_key)
 
@@ -211,9 +209,6 @@ def postprocess_midi(midi_path, audio_path=None):
     print(f"[Maestria] After filtering: {len(all_notes)} notes")
 
     # ── Step 5: Write single-track MIDI ──
-    # One instrument, one track. MuseScore will auto-split into grand staff
-    # using its own dynamic split-point algorithm — this produces a proper
-    # PianoStaff with brace instead of two separate instruments.
     clean_midi = pretty_midi.PrettyMIDI(initial_tempo=tempo)
     piano = pretty_midi.Instrument(program=0, name='Piano')
 
@@ -236,14 +231,11 @@ def postprocess_midi(midi_path, audio_path=None):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PDF — MuseScore imports MIDI directly
+# PDF — MuseScore + Supabase Storage
 # ══════════════════════════════════════════════════════════════════════════════
 
 def midi_to_pdf(midi_path, task_id, title='Untitled'):
-    """
-    Let MuseScore handle everything: MIDI import, quantization, hand split, layout, PDF.
-    MuseScore has 15+ years of MIDI import logic — no need to reinvent it.
-    """
+    """Generate PDF via MuseScore. Returns local path or None."""
     pdf_path = os.path.join(SCORES_DIR, f'{task_id}.pdf')
 
     if not mscore_cmd:
@@ -251,7 +243,6 @@ def midi_to_pdf(midi_path, task_id, title='Untitled'):
         return None
 
     try:
-        # Primary: xvfb-run for headless rendering
         result = subprocess.run(
             ['xvfb-run', '-a', mscore_cmd, '-o', pdf_path, midi_path],
             capture_output=True, text=True, timeout=120
@@ -261,7 +252,6 @@ def midi_to_pdf(midi_path, task_id, title='Untitled'):
             print(f"[Maestria] PDF generated: {pdf_path}")
             return pdf_path
 
-        # Fallback: QT offscreen
         env = {**os.environ, 'QT_QPA_PLATFORM': 'offscreen'}
         result2 = subprocess.run(
             [mscore_cmd, '-o', pdf_path, midi_path],
@@ -273,11 +263,53 @@ def midi_to_pdf(midi_path, task_id, title='Untitled'):
             return pdf_path
 
         print(f"[Maestria] MuseScore failed — stderr: {result.stderr[:500]}")
-        print(f"[Maestria] MuseScore fallback stderr: {result2.stderr[:500]}")
         return None
 
     except Exception as e:
         print(f"[Maestria] PDF generation failed: {e}")
+        traceback.print_exc()
+        return None
+
+
+def upload_pdf_to_supabase(pdf_path, composition_id=None):
+    """
+    Upload PDF to Supabase Storage bucket 'scores'.
+    Returns the public URL or None.
+    Also updates the composition record if compositionId is provided.
+    """
+    if not supabase:
+        print("[Maestria] Supabase not configured — skipping upload")
+        return None
+
+    try:
+        filename = os.path.basename(pdf_path)
+        storage_path = f"{filename}"
+
+        with open(pdf_path, 'rb') as f:
+            pdf_bytes = f.read()
+
+        # Upload to Supabase Storage
+        res = supabase.storage.from_(SCORE_BUCKET).upload(
+            storage_path,
+            pdf_bytes,
+            file_options={"content-type": "application/pdf", "upsert": "true"}
+        )
+
+        # Build public URL
+        public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SCORE_BUCKET}/{storage_path}"
+        print(f"[Maestria] PDF uploaded: {public_url}")
+
+        # Update composition record if ID provided
+        if composition_id:
+            supabase.table('compositions').update({
+                'score_pdf_url': public_url
+            }).eq('id', composition_id).execute()
+            print(f"[Maestria] Composition {composition_id[:8]} updated with PDF URL")
+
+        return public_url
+
+    except Exception as e:
+        print(f"[Maestria] PDF upload failed: {e}")
         traceback.print_exc()
         return None
 
@@ -287,34 +319,24 @@ def midi_to_pdf(midi_path, task_id, title='Untitled'):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def midi_to_musicxml(midi_path, title='Untitled'):
-    """
-    Try to produce MusicXML via Partitura. If it fails, return empty string.
-    This is used for in-app OSMD display — the PDF is the critical output.
-    """
     if not HAS_PARTITURA:
         return ''
-
     try:
         score = pt.load_score_midi(
             midi_path,
             part_voice_assign_mode=0,
             quantization_unit=None,
-            estimate_voice_info=False,  # Disabled — crashes on AMT output
+            estimate_voice_info=False,
             estimate_key=False,
             assign_note_ids=True,
         )
-
         with tempfile.NamedTemporaryFile(suffix='.musicxml', delete=False) as f:
             xml_path = f.name
-
         pt.save_musicxml(score, xml_path)
-
         with open(xml_path, 'r', encoding='utf-8') as f:
             xml_content = f.read()
-
         os.unlink(xml_path)
         return xml_content
-
     except Exception as e:
         print(f"[Maestria] MusicXML generation failed (non-critical): {e}")
         return ''
@@ -324,7 +346,7 @@ def midi_to_musicxml(midi_path, title='Untitled'):
 # BACKGROUND WORKER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def transcribe_worker(task_id, audio_url, title):
+def transcribe_worker(task_id, audio_url, title, composition_id=None):
     try:
         print(f"[Maestria] [{task_id[:8]}] Downloading: {audio_url[:80]}...")
         resp = http_requests.get(audio_url, timeout=60)
@@ -364,11 +386,20 @@ def transcribe_worker(task_id, audio_url, title):
         all_notes.sort(key=lambda n: (n['startTime'], n['pitch']))
         print(f"[Maestria] [{task_id[:8]}] {len(all_notes)} notes extracted")
 
-        # ── PDF via MuseScore (critical path) ──
+        # ── PDF via MuseScore ──
         print(f"[Maestria] [{task_id[:8]}] Generating PDF via MuseScore...")
         pdf_path = midi_to_pdf(clean_midi_path, task_id, title)
         has_pdf = pdf_path is not None and os.path.exists(pdf_path)
         print(f"[Maestria] [{task_id[:8]}] PDF: {'yes' if has_pdf else 'no'}")
+
+        # ── Upload PDF to Supabase Storage ──
+        score_pdf_url = None
+        if has_pdf:
+            print(f"[Maestria] [{task_id[:8]}] Uploading PDF to Supabase...")
+            score_pdf_url = upload_pdf_to_supabase(pdf_path, composition_id)
+            # Clean up local PDF after upload
+            try: os.unlink(pdf_path)
+            except: pass
 
         # ── MusicXML via Partitura (best-effort) ──
         print(f"[Maestria] [{task_id[:8]}] Generating MusicXML (best-effort)...")
@@ -381,16 +412,16 @@ def transcribe_worker(task_id, audio_url, title):
             except: pass
         gc.collect()
 
-        print(f"[Maestria] [{task_id[:8]}] Complete: {len(all_notes)} notes")
+        print(f"[Maestria] [{task_id[:8]}] Complete: {len(all_notes)} notes, PDF URL: {score_pdf_url or 'none'}")
 
         tasks[task_id] = {
             'status': 'complete',
             'result': {
                 'notes': all_notes,
                 'musicxml': musicxml,
-                'abc': '',  # Deprecated
                 'noteCount': len(all_notes),
-                'hasPdf': has_pdf,
+                'hasPdf': has_pdf and score_pdf_url is not None,
+                'scorePdfUrl': score_pdf_url,
             }
         }
 
@@ -410,6 +441,7 @@ def transcribe():
     data = request.json or {}
     audio_url = data.get('audioUrl')
     title = data.get('title', 'Untitled')
+    composition_id = data.get('compositionId')  # Optional — for direct DB update
 
     if not audio_url:
         return jsonify({'error': 'audioUrl required'}), 400
@@ -417,7 +449,10 @@ def transcribe():
     task_id = str(uuid.uuid4())
     tasks[task_id] = {'status': 'processing'}
 
-    thread = threading.Thread(target=transcribe_worker, args=(task_id, audio_url, title))
+    thread = threading.Thread(
+        target=transcribe_worker,
+        args=(task_id, audio_url, title, composition_id)
+    )
     thread.daemon = True
     thread.start()
 
@@ -446,14 +481,6 @@ def status():
         })
 
 
-@app.route('/score/<task_id>.pdf', methods=['GET'])
-def serve_pdf(task_id):
-    pdf_path = os.path.join(SCORES_DIR, f'{task_id}.pdf')
-    if os.path.exists(pdf_path):
-        return send_file(pdf_path, mimetype='application/pdf', download_name=f'score_{task_id[:8]}.pdf')
-    abort(404)
-
-
 @app.route('/health', methods=['GET'])
 def health():
     mscore_ok = False
@@ -470,6 +497,7 @@ def health():
         'status': 'ok',
         'model': 'bytedance/piano_transcription',
         'pdf_renderer': 'musescore',
+        'storage': 'supabase' if supabase else 'none',
         'musescore': mscore_ok,
         'partitura': HAS_PARTITURA,
         'device': DEVICE,

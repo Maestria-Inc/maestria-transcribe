@@ -1,4 +1,4 @@
-# Maestria Transcription Service v4.1
+# Maestria Transcription Service v4.3
 # Core
 setuptools>=69.0.0,<82.0.0
 flask==3.1.0
@@ -19,6 +19,9 @@ torch==2.5.1
 # MIDI processing
 pretty_midi==0.2.10
 
-# Notation (Partitura)
+# Notation (Partitura — best-effort MusicXML)
 partitura>=1.5.0
 pandas>=2.0.0
+
+# Storage (Supabase)
+supabase>=2.0.0
