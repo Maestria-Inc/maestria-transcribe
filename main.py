@@ -85,6 +85,15 @@ def postprocess_midi(midi_path, audio_path=None):
     """
     Clean up ByteDance MIDI output and split into RH/LH tracks.
 
+    Constraints applied:
+    - Ghost notes filtered (velocity < 35)
+    - Micro-notes filtered (< 40ms)
+    - Duration clamped (tempo-aware)
+    - Max 4 simultaneous onset notes per hand
+    - Hand span max 15 semitones (a 10th) per chord
+    - Max 3 sustained notes per hand at any time
+    - Split into RH/LH tracks for MuseScore
+
     Returns (clean_midi_path, detected_tempo).
     """
     midi = pretty_midi.PrettyMIDI(midi_path)
@@ -99,7 +108,6 @@ def postprocess_midi(midi_path, audio_path=None):
             else:
                 tempo = float(tempo)
 
-            # librosa often detects double tempo for piano
             if tempo > 140:
                 tempo = tempo / 2.0
                 print(f"[Maestria] Tempo halved (likely double-detected): {tempo:.0f} BPM")
@@ -127,7 +135,7 @@ def postprocess_midi(midi_path, audio_path=None):
 
     print(f"[Maestria] Max note duration: {max_duration:.2f}s")
 
-    # ── Collect all notes from all instruments ──
+    # ── Collect all notes ──
     all_notes = []
     for instrument in midi.instruments:
         if instrument.is_drum:
@@ -136,7 +144,7 @@ def postprocess_midi(midi_path, audio_path=None):
 
     all_notes.sort(key=lambda n: (n.start, n.pitch))
 
-    # ── Step 1: Filter ghost notes (higher threshold for cleaner partition) ──
+    # ── Step 1: Filter ghost notes ──
     all_notes = [n for n in all_notes if n.velocity >= 35]
 
     # ── Step 2: Remove micro-notes ──
@@ -156,8 +164,9 @@ def postprocess_midi(midi_path, audio_path=None):
             if n.end <= n.start:
                 n.end = n.start + 0.05
 
-    # ── Step 4: Reduce clusters (max 4 notes per hand) ──
+    # ── Step 4: Reduce clusters + enforce hand span ──
     MAX_PER_HAND = 4
+    MAX_SPAN = 15  # semitones — a 10th, generous but realistic
     SPLIT_POINT = 60
 
     onset_groups = []
@@ -175,10 +184,25 @@ def postprocess_midi(midi_path, audio_path=None):
     for group in onset_groups:
         rh = sorted([n for n in group if n.pitch >= SPLIT_POINT], key=lambda n: -n.velocity)
         lh = sorted([n for n in group if n.pitch < SPLIT_POINT], key=lambda n: -n.velocity)
+
+        # Limit count per hand
         for excess in rh[MAX_PER_HAND:]:
             notes_to_remove.add(id(excess))
         for excess in lh[MAX_PER_HAND:]:
             notes_to_remove.add(id(excess))
+
+        # Enforce hand span — keep highest-velocity notes within span
+        for hand_notes in [rh[:MAX_PER_HAND], lh[:MAX_PER_HAND]]:
+            if len(hand_notes) < 2:
+                continue
+            # Sort by pitch to check span
+            by_pitch = sorted(hand_notes, key=lambda n: n.pitch)
+            while len(by_pitch) > 1 and (by_pitch[-1].pitch - by_pitch[0].pitch) > MAX_SPAN:
+                # Remove the note with lowest velocity from extremes
+                if by_pitch[0].velocity <= by_pitch[-1].velocity:
+                    notes_to_remove.add(id(by_pitch.pop(0)))
+                else:
+                    notes_to_remove.add(id(by_pitch.pop(-1)))
 
     all_notes = [n for n in all_notes if id(n) not in notes_to_remove]
 
@@ -192,25 +216,25 @@ def postprocess_midi(midi_path, audio_path=None):
             deduped.append(n)
     all_notes = deduped
 
-    # ── Step 6: Limit simultaneous sounding notes (not just onset clusters) ──
-    # At any point in time, max 4 notes per hand should be sounding
-    # This catches sustained notes that overlap with new onsets
+    # ── Step 6: Limit sustained polyphony (max 3 per hand) ──
+    # This is the key constraint for readability: no more than 3 notes
+    # sounding at the same time per hand. This prevents MuseScore from
+    # creating 4 independent voices with competing stems/beams.
+    MAX_SUSTAINED = 3
     all_notes.sort(key=lambda n: n.start)
     final_notes = []
     for n in all_notes:
-        hand = 'rh' if n.pitch >= SPLIT_POINT else 'lh'
-        # Count how many notes of same hand are active at this note's start
+        is_rh = n.pitch >= SPLIT_POINT
         active = sum(1 for fn in final_notes
                      if fn.start <= n.start < fn.end
-                     and (fn.pitch >= SPLIT_POINT) == (hand == 'rh'))
-        if active < MAX_PER_HAND:
+                     and (fn.pitch >= SPLIT_POINT) == is_rh)
+        if active < MAX_SUSTAINED:
             final_notes.append(n)
     all_notes = final_notes
 
     print(f"[Maestria] After filtering: {len(all_notes)} notes")
 
     # ── Step 7: Split into two tracks (RH / LH) ──
-    # This is critical for MuseScore: each track becomes a staff
     clean_midi = pretty_midi.PrettyMIDI(initial_tempo=tempo)
 
     rh_inst = pretty_midi.Instrument(program=0, name='Piano RH')
