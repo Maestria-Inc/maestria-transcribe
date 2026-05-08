@@ -1,12 +1,27 @@
-flask==3.0.3
-flask-cors==4.0.1
-requests==2.31.0
+# Maestria Transcription Service v4.0
+# Core
+flask==3.1.0
+flask-cors==5.0.1
+requests==2.32.3
+gunicorn==23.0.0
+
+# Audio
 librosa==0.10.2
-numpy<2.0
-pretty_midi==0.2.10
+soundfile==0.13.1
+numpy==1.26.4
+
+# Transcription (ByteDance)
 piano_transcription_inference==0.0.6
-torch==2.5.1+cpu
+torch==2.5.1
 --extra-index-url https://download.pytorch.org/whl/cpu
-soundfile==0.12.1
-setuptools<82
+
+# MIDI processing
+pretty_midi==0.2.10
+
+# Notation — PRIMARY (replaces music21 for score building)
+partitura>=1.5.0
+
+# Notation — SECONDARY (only used for .ly export to LilyPond)
 music21==9.1.0
+
+# LilyPond is installed via apt (see nixpacks.toml)
