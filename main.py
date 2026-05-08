@@ -164,73 +164,49 @@ def postprocess_midi(midi_path, audio_path=None):
             if n.end <= n.start:
                 n.end = n.start + 0.05
 
-    # ── Step 4: Reduce clusters + enforce hand span ──
-    MAX_PER_HAND = 4
-    MAX_SPAN = 15  # semitones — a 10th, generous but realistic
+    # ── Step 4: Unified playability filter ──
+    # Single pass: for each note, check against ALL currently sounding notes
+    # in the same hand. Enforce:
+    #   - Max 3 notes sounding at once per hand
+    #   - Max span of 15 semitones within sounding notes of same hand
+    #   - Deduplicate same pitch within 40ms
+    MAX_SOUNDING = 3
+    MAX_SPAN = 15  # semitones — a 10th
     SPLIT_POINT = 60
 
-    onset_groups = []
-    current_group = []
-    for n in sorted(all_notes, key=lambda n: n.start):
-        if not current_group or abs(n.start - current_group[0].start) <= 0.05:
-            current_group.append(n)
-        else:
-            onset_groups.append(current_group)
-            current_group = [n]
-    if current_group:
-        onset_groups.append(current_group)
+    all_notes.sort(key=lambda n: (n.start, -n.velocity))
 
-    notes_to_remove = set()
-    for group in onset_groups:
-        rh = sorted([n for n in group if n.pitch >= SPLIT_POINT], key=lambda n: -n.velocity)
-        lh = sorted([n for n in group if n.pitch < SPLIT_POINT], key=lambda n: -n.velocity)
+    accepted = []  # notes that passed all checks
+    seen_dedup = set()
 
-        # Limit count per hand
-        for excess in rh[MAX_PER_HAND:]:
-            notes_to_remove.add(id(excess))
-        for excess in lh[MAX_PER_HAND:]:
-            notes_to_remove.add(id(excess))
-
-        # Enforce hand span — keep highest-velocity notes within span
-        for hand_notes in [rh[:MAX_PER_HAND], lh[:MAX_PER_HAND]]:
-            if len(hand_notes) < 2:
-                continue
-            # Sort by pitch to check span
-            by_pitch = sorted(hand_notes, key=lambda n: n.pitch)
-            while len(by_pitch) > 1 and (by_pitch[-1].pitch - by_pitch[0].pitch) > MAX_SPAN:
-                # Remove the note with lowest velocity from extremes
-                if by_pitch[0].velocity <= by_pitch[-1].velocity:
-                    notes_to_remove.add(id(by_pitch.pop(0)))
-                else:
-                    notes_to_remove.add(id(by_pitch.pop(-1)))
-
-    all_notes = [n for n in all_notes if id(n) not in notes_to_remove]
-
-    # ── Step 5: Deduplicate ──
-    deduped = []
-    seen = set()
-    for n in sorted(all_notes, key=lambda n: (n.start, n.pitch, -n.velocity)):
-        key = (n.pitch, round(n.start * 25))
-        if key not in seen:
-            seen.add(key)
-            deduped.append(n)
-    all_notes = deduped
-
-    # ── Step 6: Limit sustained polyphony (max 3 per hand) ──
-    # This is the key constraint for readability: no more than 3 notes
-    # sounding at the same time per hand. This prevents MuseScore from
-    # creating 4 independent voices with competing stems/beams.
-    MAX_SUSTAINED = 3
-    all_notes.sort(key=lambda n: n.start)
-    final_notes = []
     for n in all_notes:
+        # Dedup: skip if same pitch within 40ms already accepted
+        dedup_key = (n.pitch, round(n.start * 25))
+        if dedup_key in seen_dedup:
+            continue
+
         is_rh = n.pitch >= SPLIT_POINT
-        active = sum(1 for fn in final_notes
-                     if fn.start <= n.start < fn.end
-                     and (fn.pitch >= SPLIT_POINT) == is_rh)
-        if active < MAX_SUSTAINED:
-            final_notes.append(n)
-    all_notes = final_notes
+
+        # Find all accepted notes in same hand that are still sounding at n.start
+        active = [a for a in accepted
+                  if a.end > n.start and (a.pitch >= SPLIT_POINT) == is_rh]
+
+        # Check 1: count
+        if len(active) >= MAX_SOUNDING:
+            continue
+
+        # Check 2: span — would adding this note create an unplayable stretch?
+        if active:
+            pitches = [a.pitch for a in active] + [n.pitch]
+            span = max(pitches) - min(pitches)
+            if span > MAX_SPAN:
+                continue
+
+        # Note passes all checks
+        accepted.append(n)
+        seen_dedup.add(dedup_key)
+
+    all_notes = accepted
 
     print(f"[Maestria] After filtering: {len(all_notes)} notes")
 
