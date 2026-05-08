@@ -227,7 +227,7 @@ def midi_to_score_partitura(midi_path, title='Untitled'):
     score = pt.load_score_midi(
         midi_path,
         part_voice_assign_mode=0,
-        quantization_unit=None,
+        quantization_unit=55,
         estimate_voice_info=True,
         estimate_key=False,
         assign_note_ids=True,
