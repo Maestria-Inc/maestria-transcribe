@@ -1,5 +1,6 @@
 # Maestria Transcription Service v4.0
 # Core
+pandas>=2.0.0
 setuptools>=69.0.0,<82.0.0
 flask==3.1.0
 flask-cors==5.0.1
