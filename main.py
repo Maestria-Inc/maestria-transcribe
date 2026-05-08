@@ -100,6 +100,13 @@ def postprocess_midi(midi_path, audio_path=None):
                 tempo = float(tempo[0]) if len(tempo) > 0 else 120.0
             else:
                 tempo = float(tempo)
+            
+            # librosa often detects double tempo for piano music
+            # (it counts eighth notes as beats). Halve if > 140 BPM.
+            if tempo > 140:
+                tempo = tempo / 2.0
+                print(f"[Maestria] Tempo halved (likely double-detected): {tempo:.0f} BPM")
+            
             beat_duration = 60.0 / tempo
             print(f"[Maestria] Detected tempo: {tempo:.0f} BPM (beat = {beat_duration:.3f}s)")
         except Exception as e:
@@ -111,15 +118,18 @@ def postprocess_midi(midi_path, audio_path=None):
         beat_duration = 0.5
 
     # Max note duration: adapted to tempo
+    # Allow up to 4 beats for slow, 3 beats for medium, 2 beats for fast
     if tempo < 72:
-        max_duration = beat_duration * 3.0
-    elif tempo > 100:
-        max_duration = beat_duration * 1.5
-    else:
+        max_duration = beat_duration * 4.0
+    elif tempo > 120:
         max_duration = beat_duration * 2.0
+    else:
+        max_duration = beat_duration * 3.0
 
-    # Absolute ceiling: 4 seconds
-    max_duration = min(max_duration, 4.0)
+    # Absolute floor: at least 1.5 seconds (a whole note at 160 BPM)
+    # Absolute ceiling: 6 seconds (very slow sustained passages)
+    max_duration = max(max_duration, 1.5)
+    max_duration = min(max_duration, 6.0)
 
     print(f"[Maestria] Max note duration: {max_duration:.2f}s")
 
