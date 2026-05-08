@@ -1,5 +1,6 @@
 # Maestria Transcription Service v4.0
 # Core
+setuptools>=69.0.0
 flask==3.1.0
 flask-cors==5.0.1
 requests==2.32.3
@@ -16,7 +17,6 @@ torch==2.5.1
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 # MIDI processing
-setuptools>=69.0.0
 pretty_midi==0.2.10
 
 # Notation — PRIMARY (replaces music21 for score building)
