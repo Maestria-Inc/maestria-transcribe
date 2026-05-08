@@ -247,7 +247,7 @@ def midi_to_score_partitura(midi_path, title='Untitled'):
         part_voice_assign_mode=0,    # All notes in one Part, voices assigned by algorithm
         quantization_unit=None,       # Auto-detect best quantization grid
         estimate_voice_info=True,     # Chew & Wu voice separation
-        estimate_key=True,            # Krumhansl key profiles
+        estimate_key=False,            # Krumhansl key profiles
         assign_note_ids=True,
     )
     
