@@ -1,7 +1,7 @@
 """
-Maestria Piano Transcription Service v4.0
+Maestria Piano Transcription Service v4.1
 ==========================================
-ByteDance transcription + post-processing + Partitura notation + LilyPond PDF.
+ByteDance transcription + post-processing + Partitura notation + MuseScore PDF.
 
 Pipeline:
   ByteDance AMT → MIDI brut
@@ -10,9 +10,9 @@ Pipeline:
        ↓
   pretty_midi → JSON notes (for falling notes in app)
        ↓
-  Partitura (quantization + voice separation + pitch spelling + key estimation)
+  Partitura (quantization + voice separation + pitch spelling)
        ↓
-  MusicXML export → LilyPond PDF
+  MusicXML export → MuseScore → PDF
 
 Outputs:
   - notes (JSON) — for falling notes display (post-processed)
@@ -20,20 +20,18 @@ Outputs:
   - pdf_url — served from this service for download
 
 Endpoints:
-  POST /transcribe  { audioUrl, title? }  ->  { taskId}
+  POST /transcribe  { audioUrl, title? }  ->  { taskId }
   GET  /status?taskId=X                   ->  { status, notes?, musicxml?, noteCount? }
   GET  /score/:taskId.pdf                 ->  PDF file
   GET  /health
 """
 
 import os
-import json
 import uuid
 import tempfile
 import traceback
 import threading
 import subprocess
-import re
 from flask import Flask, request, jsonify, send_file, abort
 from flask_cors import CORS
 import requests as http_requests
@@ -63,12 +61,16 @@ import partitura as pt
 
 print("[Maestria] Partitura loaded.")
 
-# Check LilyPond
-lily_path = subprocess.run(['which', 'lilypond'], capture_output=True, text=True).stdout.strip()
-if lily_path:
-    print(f"[Maestria] LilyPond found: {lily_path}")
-else:
-    print("[Maestria] WARNING: LilyPond not found — PDF generation will fail")
+# Check MuseScore
+mscore_cmd = None
+for cmd in ['musescore', 'mscore', 'musescore4', 'musescore3']:
+    result = subprocess.run(['which', cmd], capture_output=True, text=True)
+    if result.stdout.strip():
+        mscore_cmd = cmd
+        print(f"[Maestria] MuseScore found: {result.stdout.strip()}")
+        break
+if not mscore_cmd:
+    print("[Maestria] WARNING: MuseScore not found — PDF generation will fail")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -78,23 +80,22 @@ else:
 def postprocess_midi(midi_path, audio_path=None):
     """
     Clean up ByteDance MIDI output for both falling notes display and notation.
-    
+
     Problems solved:
     1. Notes too long (sustain/reverb captured as duration)
     2. Ghost notes (low velocity harmonics/artifacts)
     3. Impossible clusters (>6 simultaneous notes per hand)
     4. Overlapping notes on same pitch
-    
-    Returns the path to the cleaned MIDI file.
+
+    Returns the path to the cleaned MIDI file and detected tempo.
     """
     midi = pretty_midi.PrettyMIDI(midi_path)
-    
-    # Estimate tempo from audio if available, otherwise from MIDI
+
+    # Estimate tempo from audio if available
     if audio_path:
         try:
             y, sr = librosa.load(audio_path, sr=22050, mono=True)
             tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
-            # librosa can return an array; extract scalar
             if hasattr(tempo, '__len__'):
                 tempo = float(tempo[0]) if len(tempo) > 0 else 120.0
             else:
@@ -108,65 +109,51 @@ def postprocess_midi(midi_path, audio_path=None):
     else:
         tempo = 120.0
         beat_duration = 0.5
-    
-    # Max note duration: 2 beats (context-aware)
-    # For slow pieces (tempo < 72), allow up to 3 beats
-    # For fast pieces (tempo > 100), cap at 1.5 beats
+
+    # Max note duration: adapted to tempo
     if tempo < 72:
         max_duration = beat_duration * 3.0
     elif tempo > 100:
         max_duration = beat_duration * 1.5
     else:
         max_duration = beat_duration * 2.0
-    
-    # Absolute ceiling: 4 seconds regardless of tempo
+
+    # Absolute ceiling: 4 seconds
     max_duration = min(max_duration, 4.0)
-    
+
     print(f"[Maestria] Max note duration: {max_duration:.2f}s")
-    
+
     for instrument in midi.instruments:
         if instrument.is_drum:
             continue
-        
-        # Sort by start time then pitch
+
         instrument.notes.sort(key=lambda n: (n.start, n.pitch))
-        
-        # ── Step 1: Filter ghost notes (low velocity artifacts) ──
+
+        # Step 1: Filter ghost notes (low velocity artifacts)
         instrument.notes = [n for n in instrument.notes if n.velocity >= 25]
-        
-        # ── Step 2: Remove very short notes (< 30ms — likely onset artifacts) ──
+
+        # Step 2: Remove very short notes (< 30ms)
         instrument.notes = [n for n in instrument.notes if (n.end - n.start) >= 0.03]
-        
-        # ── Step 3: Clamp durations ──
-        # For each note, the end time is the minimum of:
-        #   a) its current end time
-        #   b) the start of the next note on the same pitch (minus tiny gap)
-        #   c) max_duration after its start
+
+        # Step 3: Clamp durations
         notes_by_pitch = {}
         for n in instrument.notes:
             notes_by_pitch.setdefault(n.pitch, []).append(n)
-        
+
         for pitch, pnotes in notes_by_pitch.items():
             pnotes.sort(key=lambda n: n.start)
             for i, n in enumerate(pnotes):
-                # Cap at max duration
                 n.end = min(n.end, n.start + max_duration)
-                # Don't overlap with next note on same pitch
                 if i + 1 < len(pnotes):
                     next_start = pnotes[i + 1].start
-                    # Leave a tiny gap (20ms) for note separation
                     n.end = min(n.end, next_start - 0.02)
-                # Ensure minimum duration after clamping
                 if n.end <= n.start:
                     n.end = n.start + 0.05
-        
-        # ── Step 4: Reduce impossible clusters ──
-        # No more than 5 simultaneous notes per hand (split at MIDI 60 = C4)
-        # If more, keep the ones with highest velocity
+
+        # Step 4: Reduce impossible clusters (max 5 per hand)
         MAX_PER_HAND = 5
         SPLIT_POINT = 60
-        
-        # Group notes by approximate onset (within 50ms)
+
         onset_groups = []
         current_group = []
         for n in sorted(instrument.notes, key=lambda n: n.start):
@@ -177,59 +164,47 @@ def postprocess_midi(midi_path, audio_path=None):
                 current_group = [n]
         if current_group:
             onset_groups.append(current_group)
-        
+
         notes_to_remove = set()
         for group in onset_groups:
-            # Split into hands
             rh = sorted([n for n in group if n.pitch >= SPLIT_POINT], key=lambda n: -n.velocity)
             lh = sorted([n for n in group if n.pitch < SPLIT_POINT], key=lambda n: -n.velocity)
-            
-            # Mark excess notes for removal
             for excess in rh[MAX_PER_HAND:]:
                 notes_to_remove.add(id(excess))
             for excess in lh[MAX_PER_HAND:]:
                 notes_to_remove.add(id(excess))
-        
+
         instrument.notes = [n for n in instrument.notes if id(n) not in notes_to_remove]
-        
-        # ── Step 5: Deduplicate near-simultaneous same-pitch notes ──
-        # If two notes on the same pitch start within 40ms, keep the louder one
+
+        # Step 5: Deduplicate near-simultaneous same-pitch notes
         deduped = []
         seen = set()
         for n in sorted(instrument.notes, key=lambda n: (n.start, n.pitch, -n.velocity)):
-            key = (n.pitch, round(n.start * 25))  # ~40ms buckets
+            key = (n.pitch, round(n.start * 25))
             if key not in seen:
                 seen.add(key)
                 deduped.append(n)
         instrument.notes = deduped
-    
-    # Write cleaned MIDI
+
+    # Write cleaned MIDI with correct tempo
     clean_path = midi_path.replace('.mid', '_clean.mid')
-    
-    # Set tempo in the MIDI file (important for Partitura quantization)
-    # Remove existing tempo changes and set a single tempo
-    midi.tempo_changes = []  # Clear — we'll set via initial tempo
-    # pretty_midi uses initial_tempo in the constructor, but we can adjust
-    # by writing a tempo change at time 0
-    # The simplest approach: write to a new PrettyMIDI with correct tempo
     clean_midi = pretty_midi.PrettyMIDI(initial_tempo=tempo)
     for inst in midi.instruments:
         clean_inst = pretty_midi.Instrument(program=inst.program, is_drum=inst.is_drum, name=inst.name)
         clean_inst.notes = inst.notes
         clean_inst.control_changes = inst.control_changes
         clean_midi.instruments.append(clean_inst)
-    
+
     clean_midi.write(clean_path)
-    
-    # Stats
+
     total_notes = sum(len(inst.notes) for inst in clean_midi.instruments)
     print(f"[Maestria] Post-processed: {total_notes} notes, tempo={tempo:.0f}")
-    
+
     return clean_path, tempo
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NOTATION — Partitura-based pipeline
+# NOTATION — Partitura + MuseScore
 # ══════════════════════════════════════════════════════════════════════════════
 
 def midi_to_score_partitura(midi_path, title='Untitled'):
@@ -238,52 +213,29 @@ def midi_to_score_partitura(midi_path, title='Untitled'):
     - Automatic quantization
     - Voice separation (Chew & Wu algorithm)
     - Pitch spelling (PS13 algorithm)
-    - Key estimation (Krumhansl profiles)
-    
-    Returns a Partitura Score object.
     """
     score = pt.load_score_midi(
         midi_path,
-        part_voice_assign_mode=0,    # All notes in one Part, voices assigned by algorithm
-        quantization_unit=None,       # Auto-detect best quantization grid
-        estimate_voice_info=True,     # Chew & Wu voice separation
-        estimate_key=False,            # Krumhansl key profiles
+        part_voice_assign_mode=0,
+        quantization_unit=None,
+        estimate_voice_info=True,
+        estimate_key=False,
         assign_note_ids=True,
     )
-    
     return score
 
 
-def score_to_musicxml_partitura(score, title='Untitled'):
+def score_to_musicxml(score, title='Untitled'):
     """Export Partitura score to MusicXML string."""
     try:
-        with tempfile.NamedTemporaryFile(suffix='.musicxml', delete=False, mode='w') as f:
+        with tempfile.NamedTemporaryFile(suffix='.musicxml', delete=False) as f:
             xml_path = f.name
-        
+
         pt.save_musicxml(score, xml_path)
-        
+
         with open(xml_path, 'r', encoding='utf-8') as f:
             xml_content = f.read()
-        
-        # Inject title and composer into MusicXML if not present
-        if '<work-title>' not in xml_content and '<movement-title>' not in xml_content:
-            # Add identification block after the first <score-partwise> tag
-            ident_block = f"""
-  <work>
-    <work-title>{title}</work-title>
-  </work>
-  <identification>
-    <creator type="composer">Maestria</creator>
-  </identification>"""
-            xml_content = xml_content.replace(
-                '<score-partwise',
-                f'<score-partwise',
-                1
-            )
-            # Insert after the opening tag
-            insert_pos = xml_content.find('>', xml_content.find('<score-partwise')) + 1
-            xml_content = xml_content[:insert_pos] + ident_block + xml_content[insert_pos:]
-        
+
         os.unlink(xml_path)
         return xml_content
     except Exception as e:
@@ -292,136 +244,57 @@ def score_to_musicxml_partitura(score, title='Untitled'):
         return ''
 
 
-def score_to_pdf_lilypond(score, task_id, title='Untitled'):
-    """
-    Export Partitura score to PDF via LilyPond.
-    
-    Pipeline: Partitura → MusicXML → music21 (only for LilyPond export) → .ly → LilyPond → PDF
-    
-    Alternative: Partitura → MusicXML → MuseScore CLI → PDF
-    But LilyPond gives better typesetting quality.
-    """
+def score_to_pdf(score, task_id, title='Untitled'):
+    """Export Partitura score to PDF via MuseScore. No music21 involved."""
+    xml_path = os.path.join(SCORES_DIR, f'{task_id}.musicxml')
     pdf_path = os.path.join(SCORES_DIR, f'{task_id}.pdf')
-    output_base = os.path.join(SCORES_DIR, task_id)
-    ly_path = os.path.join(SCORES_DIR, f'{task_id}.ly')
-    xml_path = os.path.join(SCORES_DIR, f'{task_id}_temp.musicxml')
-    
+
     try:
-        # Step 1: Save Partitura score as MusicXML
         pt.save_musicxml(score, xml_path)
-        
-        # Step 2: Use music21 ONLY for the LilyPond conversion
-        # (Partitura doesn't have a native LilyPond exporter)
-        import music21
-        from music21 import converter as m21_converter
-        
-        m21_score = m21_converter.parse(xml_path)
-        
-        # Set metadata
-        m21_score.metadata = music21.metadata.Metadata()
-        m21_score.metadata.title = title
-        m21_score.metadata.composer = 'Maestria'
-        
-        # Write LilyPond source
-        m21_score.write('lily', fp=ly_path)
-        
-        # Clean up temp XML
-        try: os.unlink(xml_path)
-        except: pass
-        
-        # Step 3: Post-process the .ly file
-        with open(ly_path, 'r', encoding='utf-8', errors='replace') as f:
-            ly_content = f.read()
-        
-        # Remove lilypond-book-preamble (forces compact layout)
-        ly_content = ly_content.replace('\\include "lilypond-book-preamble.ly"', '')
-        
-        # Remove music21's color function definition
-        ly_content = re.sub(
-            r'color = #\(define-music-function.*?#\}\)', '', ly_content, flags=re.DOTALL
-        )
-        
-        # Wrap staves in PianoStaff for brace + connected barlines
-        ly_content = ly_content.replace(
-            '\\score  { \n      <<',
-            '\\score  { \n      \\new PianoStaff <<'
-        )
-        ly_content = ly_content.replace(
-            '\\score  {\n      <<',
-            '\\score  {\n      \\new PianoStaff <<'
-        )
-        ly_content = ly_content.replace(
-            '\\score { \n<<',
-            '\\score { \n\\new PianoStaff <<'
-        )
-        
-        # Inject layout block
-        layout_block = r"""
-  \layout {
-    \context {
-      \Staff
-      \override VerticalAxisGroup.remove-empty = ##f
-      \override VerticalAxisGroup.remove-first = ##f
-    }
-  }
-"""
-        last_brace = ly_content.rfind('}')
-        if last_brace > 0:
-            ly_content = ly_content[:last_brace] + layout_block + ly_content[last_brace:]
-        
-        # Paper block
-        paper_block = r"""
-\paper {
-  #(set-paper-size "a4")
-  indent = 12\mm
-  short-indent = 5\mm
-  top-margin = 15\mm
-  bottom-margin = 15\mm
-  left-margin = 15\mm
-  right-margin = 15\mm
-  system-system-spacing = #'((basic-distance . 16) (padding . 3))
-  ragged-last-bottom = ##t
-}
-"""
-        # Replace header
-        ly_content = re.sub(
-            r'\\header\s*\{[^}]*\}',
-            r'\\header {\n  title = "' + title.replace('"', '\\"') +
-            r'"\n  composer = "Maestria"\n  tagline = \\markup { \\small \\italic "© 2026 Maestria — Original Composition" }\n}',
-            ly_content
-        )
-        
-        # Insert paper after \version line
-        version_end = ly_content.find('\n', ly_content.find('\\version'))
-        if version_end > 0:
-            ly_content = ly_content[:version_end + 1] + paper_block + ly_content[version_end + 1:]
-        
-        with open(ly_path, 'w', encoding='utf-8') as f:
-            f.write(ly_content)
-        
-        # Step 4: Run LilyPond
+
+        if not mscore_cmd:
+            print("[Maestria] MuseScore not available — skipping PDF")
+            try: os.unlink(xml_path)
+            except: pass
+            return None
+
+        # Try xvfb-run first (MuseScore needs a display)
         result = subprocess.run(
-            ['lilypond', '-dno-point-and-click', '--pdf', '-o', output_base, ly_path],
+            ['xvfb-run', '-a', mscore_cmd, '-o', pdf_path, xml_path],
             capture_output=True, text=True, timeout=120
         )
-        
-        try: os.unlink(ly_path)
-        except: pass
-        
+
         if os.path.exists(pdf_path):
             print(f"[Maestria] PDF generated: {pdf_path}")
+            try: os.unlink(xml_path)
+            except: pass
             return pdf_path
-        
-        print(f"[Maestria] LilyPond failed — stderr: {result.stderr[:500]}")
+
+        # Fallback: QT_QPA_PLATFORM=offscreen without xvfb
+        env = {**os.environ, 'QT_QPA_PLATFORM': 'offscreen'}
+        result2 = subprocess.run(
+            [mscore_cmd, '-o', pdf_path, xml_path],
+            capture_output=True, text=True, timeout=120, env=env
+        )
+
+        if os.path.exists(pdf_path):
+            print(f"[Maestria] PDF generated (offscreen): {pdf_path}")
+            try: os.unlink(xml_path)
+            except: pass
+            return pdf_path
+
+        print(f"[Maestria] MuseScore failed — stderr: {result.stderr[:500]}")
+        print(f"[Maestria] MuseScore fallback stderr: {result2.stderr[:500]}")
+
+        try: os.unlink(xml_path)
+        except: pass
         return None
-        
+
     except Exception as e:
         print(f"[Maestria] PDF generation failed: {e}")
         traceback.print_exc()
-        # Cleanup
-        for p in [xml_path, ly_path]:
-            try: os.unlink(p)
-            except: pass
+        try: os.unlink(xml_path)
+        except: pass
         return None
 
 
@@ -473,11 +346,11 @@ def transcribe_worker(task_id, audio_url, title):
         print(f"[Maestria] [{task_id[:8]}] Generating notation via Partitura...")
         score = midi_to_score_partitura(clean_midi_path, title)
 
-        musicxml = score_to_musicxml_partitura(score, title)
+        musicxml = score_to_musicxml(score, title)
         print(f"[Maestria] [{task_id[:8]}] MusicXML: {len(musicxml)} chars")
 
-        # PDF generation
-        pdf_path = score_to_pdf_lilypond(score, task_id, title)
+        # ── PDF via MuseScore ──
+        pdf_path = score_to_pdf(score, task_id, title)
         has_pdf = pdf_path is not None and os.path.exists(pdf_path)
         print(f"[Maestria] [{task_id[:8]}] PDF: {'yes' if has_pdf else 'no'}")
 
@@ -494,7 +367,7 @@ def transcribe_worker(task_id, audio_url, title):
             'result': {
                 'notes': all_notes,
                 'musicxml': musicxml,
-                'abc': '',  # Deprecated — kept for backward compat
+                'abc': '',  # Deprecated
                 'noteCount': len(all_notes),
                 'hasPdf': has_pdf,
             }
@@ -563,10 +436,13 @@ def serve_pdf(task_id):
 
 @app.route('/health', methods=['GET'])
 def health():
-    lily_ok = False
+    mscore_ok = False
     try:
-        result = subprocess.run(['lilypond', '--version'], capture_output=True, text=True, timeout=5)
-        lily_ok = result.returncode == 0
+        result = subprocess.run(
+            [mscore_cmd or 'musescore', '--version'],
+            capture_output=True, text=True, timeout=5
+        )
+        mscore_ok = result.returncode == 0
     except:
         pass
 
@@ -574,7 +450,8 @@ def health():
         'status': 'ok',
         'model': 'bytedance/piano_transcription',
         'notation': 'partitura',
-        'lilypond': lily_ok,
+        'pdf_renderer': 'musescore',
+        'musescore': mscore_ok,
         'device': DEVICE,
         'active_tasks': sum(1 for t in tasks.values() if t['status'] == 'processing'),
     })

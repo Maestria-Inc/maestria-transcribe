@@ -1,6 +1,5 @@
-# Maestria Transcription Service v4.0
+# Maestria Transcription Service v4.1
 # Core
-pandas>=2.0.0
 setuptools>=69.0.0,<82.0.0
 flask==3.1.0
 flask-cors==5.0.1
@@ -20,10 +19,6 @@ torch==2.5.1
 # MIDI processing
 pretty_midi==0.2.10
 
-# Notation — PRIMARY (replaces music21 for score building)
+# Notation (Partitura)
 partitura>=1.5.0
-
-# Notation — SECONDARY (only used for .ly export to LilyPond)
-music21==9.1.0
-
-# LilyPond is installed via apt (see nixpacks.toml)
+pandas>=2.0.0

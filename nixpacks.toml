@@ -1,5 +1,5 @@
 [phases.setup]
-aptPkgs = ["ffmpeg", "libsndfile1", "wget", "lilypond", "musescore", "xvfb"]
+aptPkgs = ["ffmpeg", "libsndfile1", "wget", "musescore", "xvfb"]
 
-[phases.build]
-cmds = ["pip install --no-cache-dir setuptools<82 && pip install --no-cache-dir -r requirements.txt"]
+[phases.install]
+cmds = ["pip install --no-cache-dir 'setuptools<82' && pip install --no-cache-dir -r requirements.txt"]
