@@ -368,25 +368,55 @@ def transcribe_worker(task_id, audio_url, title, composition_id=None):
         with transcribe_lock:
             transcriptor.transcribe(audio, midi_path)
 
-        # ── Post-process ──
-        print(f"[Maestria] [{task_id[:8]}] Post-processing MIDI...")
-        clean_midi_path, detected_tempo = postprocess_midi(midi_path, audio_path)
-
-        # ── JSON notes for falling display ──
-        midi_data = pretty_midi.PrettyMIDI(clean_midi_path)
-        all_notes = []
-        for instr in midi_data.instruments:
+        # ── Extract falling notes FIRST (light filtering only) ──
+        # These need to be faithful to the audio, not playable on paper
+        print(f"[Maestria] [{task_id[:8]}] Extracting display notes (light filter)...")
+        raw_midi = pretty_midi.PrettyMIDI(midi_path)
+        display_notes = []
+        
+        # Detect tempo for duration clamping
+        try:
+            y_tempo, sr_tempo = librosa.load(audio_path, sr=22050, mono=True)
+            detected_tempo, _ = librosa.beat.beat_track(y=y_tempo, sr=sr_tempo)
+            if hasattr(detected_tempo, '__len__'):
+                detected_tempo = float(detected_tempo[0]) if len(detected_tempo) > 0 else 120.0
+            else:
+                detected_tempo = float(detected_tempo)
+            if detected_tempo > 140:
+                detected_tempo = detected_tempo / 2.0
+        except:
+            detected_tempo = 120.0
+        
+        beat_dur = 60.0 / detected_tempo
+        display_max_dur = min(beat_dur * 4.0, 6.0)  # generous for display
+        
+        for instr in raw_midi.instruments:
+            if instr.is_drum:
+                continue
             for n in instr.notes:
-                all_notes.append({
+                # Light filter: only remove very quiet ghost notes and micro-notes
+                if n.velocity < 20:
+                    continue
+                if (n.end - n.start) < 0.03:
+                    continue
+                # Clamp duration but more generously than partition
+                end = min(n.end, n.start + display_max_dur)
+                if end <= n.start:
+                    end = n.start + 0.05
+                display_notes.append({
                     'pitch': n.pitch,
                     'startTime': round(n.start, 4),
-                    'endTime': round(n.end, 4),
+                    'endTime': round(end, 4),
                     'velocity': n.velocity,
                 })
-        all_notes.sort(key=lambda n: (n['startTime'], n['pitch']))
-        print(f"[Maestria] [{task_id[:8]}] {len(all_notes)} notes extracted")
+        display_notes.sort(key=lambda n: (n['startTime'], n['pitch']))
+        print(f"[Maestria] [{task_id[:8]}] {len(display_notes)} display notes extracted")
 
-        # ── PDF via MuseScore ──
+        # ── Post-process for partition (aggressive filtering) ──
+        print(f"[Maestria] [{task_id[:8]}] Post-processing MIDI for partition...")
+        clean_midi_path, _ = postprocess_midi(midi_path, audio_path)
+
+        # ── PDF via MuseScore (uses aggressively filtered MIDI) ──
         print(f"[Maestria] [{task_id[:8]}] Generating PDF via MuseScore...")
         pdf_path = midi_to_pdf(clean_midi_path, task_id, title)
         has_pdf = pdf_path is not None and os.path.exists(pdf_path)
@@ -412,14 +442,14 @@ def transcribe_worker(task_id, audio_url, title, composition_id=None):
             except: pass
         gc.collect()
 
-        print(f"[Maestria] [{task_id[:8]}] Complete: {len(all_notes)} notes, PDF URL: {score_pdf_url or 'none'}")
+        print(f"[Maestria] [{task_id[:8]}] Complete: {len(display_notes)} display notes, PDF URL: {score_pdf_url or 'none'}")
 
         tasks[task_id] = {
             'status': 'complete',
             'result': {
-                'notes': all_notes,
+                'notes': display_notes,
                 'musicxml': musicxml,
-                'noteCount': len(all_notes),
+                'noteCount': len(display_notes),
                 'hasPdf': has_pdf and score_pdf_url is not None,
                 'scorePdfUrl': score_pdf_url,
             }
