@@ -83,7 +83,7 @@ if not mscore_cmd:
 
 def postprocess_midi(midi_path, audio_path=None):
     """
-    Clean up ByteDance MIDI output.
+    Clean up ByteDance MIDI output and split into RH/LH tracks.
 
     Returns (clean_midi_path, detected_tempo).
     """
@@ -127,80 +127,113 @@ def postprocess_midi(midi_path, audio_path=None):
 
     print(f"[Maestria] Max note duration: {max_duration:.2f}s")
 
+    # ── Collect all notes from all instruments ──
+    all_notes = []
     for instrument in midi.instruments:
         if instrument.is_drum:
             continue
+        all_notes.extend(instrument.notes)
 
-        instrument.notes.sort(key=lambda n: (n.start, n.pitch))
+    all_notes.sort(key=lambda n: (n.start, n.pitch))
 
-        # Step 1: Filter ghost notes
-        instrument.notes = [n for n in instrument.notes if n.velocity >= 25]
+    # ── Step 1: Filter ghost notes (higher threshold for cleaner partition) ──
+    all_notes = [n for n in all_notes if n.velocity >= 35]
 
-        # Step 2: Remove micro-notes
-        instrument.notes = [n for n in instrument.notes if (n.end - n.start) >= 0.03]
+    # ── Step 2: Remove micro-notes ──
+    all_notes = [n for n in all_notes if (n.end - n.start) >= 0.04]
 
-        # Step 3: Clamp durations
-        notes_by_pitch = {}
-        for n in instrument.notes:
-            notes_by_pitch.setdefault(n.pitch, []).append(n)
+    # ── Step 3: Clamp durations ──
+    notes_by_pitch = {}
+    for n in all_notes:
+        notes_by_pitch.setdefault(n.pitch, []).append(n)
 
-        for pitch, pnotes in notes_by_pitch.items():
-            pnotes.sort(key=lambda n: n.start)
-            for i, n in enumerate(pnotes):
-                n.end = min(n.end, n.start + max_duration)
-                if i + 1 < len(pnotes):
-                    n.end = min(n.end, pnotes[i + 1].start - 0.02)
-                if n.end <= n.start:
-                    n.end = n.start + 0.05
+    for pitch, pnotes in notes_by_pitch.items():
+        pnotes.sort(key=lambda n: n.start)
+        for i, n in enumerate(pnotes):
+            n.end = min(n.end, n.start + max_duration)
+            if i + 1 < len(pnotes):
+                n.end = min(n.end, pnotes[i + 1].start - 0.02)
+            if n.end <= n.start:
+                n.end = n.start + 0.05
 
-        # Step 4: Reduce impossible clusters
-        MAX_PER_HAND = 5
-        SPLIT_POINT = 60
+    # ── Step 4: Reduce clusters (max 4 notes per hand) ──
+    MAX_PER_HAND = 4
+    SPLIT_POINT = 60
 
-        onset_groups = []
-        current_group = []
-        for n in sorted(instrument.notes, key=lambda n: n.start):
-            if not current_group or abs(n.start - current_group[0].start) <= 0.05:
-                current_group.append(n)
-            else:
-                onset_groups.append(current_group)
-                current_group = [n]
-        if current_group:
+    onset_groups = []
+    current_group = []
+    for n in sorted(all_notes, key=lambda n: n.start):
+        if not current_group or abs(n.start - current_group[0].start) <= 0.05:
+            current_group.append(n)
+        else:
             onset_groups.append(current_group)
+            current_group = [n]
+    if current_group:
+        onset_groups.append(current_group)
 
-        notes_to_remove = set()
-        for group in onset_groups:
-            rh = sorted([n for n in group if n.pitch >= SPLIT_POINT], key=lambda n: -n.velocity)
-            lh = sorted([n for n in group if n.pitch < SPLIT_POINT], key=lambda n: -n.velocity)
-            for excess in rh[MAX_PER_HAND:]:
-                notes_to_remove.add(id(excess))
-            for excess in lh[MAX_PER_HAND:]:
-                notes_to_remove.add(id(excess))
+    notes_to_remove = set()
+    for group in onset_groups:
+        rh = sorted([n for n in group if n.pitch >= SPLIT_POINT], key=lambda n: -n.velocity)
+        lh = sorted([n for n in group if n.pitch < SPLIT_POINT], key=lambda n: -n.velocity)
+        for excess in rh[MAX_PER_HAND:]:
+            notes_to_remove.add(id(excess))
+        for excess in lh[MAX_PER_HAND:]:
+            notes_to_remove.add(id(excess))
 
-        instrument.notes = [n for n in instrument.notes if id(n) not in notes_to_remove]
+    all_notes = [n for n in all_notes if id(n) not in notes_to_remove]
 
-        # Step 5: Deduplicate
-        deduped = []
-        seen = set()
-        for n in sorted(instrument.notes, key=lambda n: (n.start, n.pitch, -n.velocity)):
-            key = (n.pitch, round(n.start * 25))
-            if key not in seen:
-                seen.add(key)
-                deduped.append(n)
-        instrument.notes = deduped
+    # ── Step 5: Deduplicate ──
+    deduped = []
+    seen = set()
+    for n in sorted(all_notes, key=lambda n: (n.start, n.pitch, -n.velocity)):
+        key = (n.pitch, round(n.start * 25))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(n)
+    all_notes = deduped
 
-    # Write cleaned MIDI
-    clean_path = midi_path.replace('.mid', '_clean.mid')
+    # ── Step 6: Limit simultaneous sounding notes (not just onset clusters) ──
+    # At any point in time, max 4 notes per hand should be sounding
+    # This catches sustained notes that overlap with new onsets
+    all_notes.sort(key=lambda n: n.start)
+    final_notes = []
+    for n in all_notes:
+        hand = 'rh' if n.pitch >= SPLIT_POINT else 'lh'
+        # Count how many notes of same hand are active at this note's start
+        active = sum(1 for fn in final_notes
+                     if fn.start <= n.start < fn.end
+                     and (fn.pitch >= SPLIT_POINT) == (hand == 'rh'))
+        if active < MAX_PER_HAND:
+            final_notes.append(n)
+    all_notes = final_notes
+
+    print(f"[Maestria] After filtering: {len(all_notes)} notes")
+
+    # ── Step 7: Split into two tracks (RH / LH) ──
+    # This is critical for MuseScore: each track becomes a staff
     clean_midi = pretty_midi.PrettyMIDI(initial_tempo=tempo)
-    for inst in midi.instruments:
-        clean_inst = pretty_midi.Instrument(program=inst.program, is_drum=inst.is_drum, name=inst.name)
-        clean_inst.notes = inst.notes
-        clean_inst.control_changes = inst.control_changes
-        clean_midi.instruments.append(clean_inst)
+
+    rh_inst = pretty_midi.Instrument(program=0, name='Piano RH')
+    lh_inst = pretty_midi.Instrument(program=0, name='Piano LH')
+
+    for n in all_notes:
+        note_copy = pretty_midi.Note(
+            velocity=n.velocity, pitch=n.pitch,
+            start=n.start, end=n.end
+        )
+        if n.pitch >= SPLIT_POINT:
+            rh_inst.notes.append(note_copy)
+        else:
+            lh_inst.notes.append(note_copy)
+
+    clean_midi.instruments.append(rh_inst)
+    clean_midi.instruments.append(lh_inst)
+
+    clean_path = midi_path.replace('.mid', '_clean.mid')
     clean_midi.write(clean_path)
 
-    total_notes = sum(len(inst.notes) for inst in clean_midi.instruments)
-    print(f"[Maestria] Post-processed: {total_notes} notes, tempo={tempo:.0f}")
+    total = len(rh_inst.notes) + len(lh_inst.notes)
+    print(f"[Maestria] Post-processed: {total} notes (RH={len(rh_inst.notes)}, LH={len(lh_inst.notes)}), tempo={tempo:.0f}")
 
     return clean_path, tempo
 
